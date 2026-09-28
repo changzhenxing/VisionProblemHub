@@ -1,0 +1,14 @@
+<!doctype html>
+<html lang="zh-CN">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>工业视觉项目与知识平台</title><link rel="stylesheet" href="/static/styles.css"></head>
+<body>
+<header>
+  <div class="brand"><div class="logo">V</div><div><b>工业视觉项目与知识平台</b><small>问题驱动 · 过程留痕 · 自动复盘 · 经验沉淀</small></div></div>
+  <nav id="nav"></nav>
+  <div class="userbox"><span>当前用户</span><select id="currentUser"></select><button class="primary" onclick="openIssueCreate()">＋ 新增问题</button></div>
+</header>
+<main id="app"><div class="loading">加载中…</div></main>
+<div id="modal" class="modal hidden"><div class="modal-card"><button class="close" onclick="closeModal()">×</button><div id="modalBody"></div></div></div>
+<div id="toast"></div>
+<script src="/static/app.js"></script>
+</body></html>
