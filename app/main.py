@@ -3,14 +3,18 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 from collections import Counter, defaultdict
 import json
-from fastapi import FastAPI, Depends, HTTPException, Query, Form, UploadFile, File
-from fastapi.responses import FileResponse
+import hashlib
+from fastapi import FastAPI, Depends, HTTPException, Query, Form, UploadFile, File, Request, Response
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy import select, func
 from sqlalchemy.orm import Session, selectinload, joinedload
 
-from .db import Base, engine, get_db, DATA_DIR
-from .models import User, Project, ProjectEvent, Issue, IssueEvent, Attachment, IssueRetrospective, ProjectRetrospective, KnowledgeCase
+from .db import Base, engine, get_db, DATA_DIR, SessionLocal
+from .models import User, Role, LoginSession, Project, ProjectEvent, Issue, IssueEvent, Attachment, IssueRetrospective, ProjectRetrospective, KnowledgeCase
+from .auth import (COOKIE_NAME, SESSION_HOURS, PERMISSIONS, ensure_auth_schema, hash_password, verify_password,
+                   setup_required, permissions_for, user_dict, role_dict, create_session, session_user,
+                   authenticated_user, required_permission)
 from .schemas import *
 from .services import (
     is_delayed, delay_days, project_health, add_event, save_attachment,
@@ -19,13 +23,106 @@ from .services import (
 )
 
 Base.metadata.create_all(bind=engine)
+ensure_auth_schema()
 app=FastAPI(title="以问题驱动的工业视觉项目管理与知识沉淀平台", version="2.0.0")
 STATIC_DIR=Path(__file__).resolve().parent/"static"
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 app.mount("/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads")
 
+@app.middleware("http")
+async def authentication(request: Request, call_next):
+    path = request.url.path
+    if not path.startswith("/api/") and not path.startswith("/uploads/"):
+        return await call_next(request)
+    if request.method not in {"GET", "HEAD", "OPTIONS"}:
+        origin = request.headers.get("origin")
+        if origin and origin != f"{request.url.scheme}://{request.headers.get('host')}":
+            return JSONResponse({"detail": "请求来源不匹配"}, status_code=403)
+    if path in {"/api/auth/status", "/api/auth/setup", "/api/auth/login"}:
+        return await call_next(request)
+    with SessionLocal() as db:
+        user = session_user(db, request.cookies.get(COOKIE_NAME))
+        if not user:
+            return JSONResponse({"detail": "请先登录"}, status_code=401)
+        request.state.user_id = user.id
+        request.state.permissions = permissions_for(user)
+        permission = required_permission(path, request.method)
+        role_catalog = (path.startswith("/api/admin/roles") or path == "/api/admin/permissions") and request.method == "GET"
+        if role_catalog and not request.state.permissions.intersection({"users.manage", "roles.manage"}):
+            return JSONResponse({"detail": "当前角色没有此操作权限"}, status_code=403)
+        if permission and permission not in request.state.permissions and not role_catalog:
+            return JSONResponse({"detail": "当前角色没有此操作权限"}, status_code=403)
+    return await call_next(request)
+
 @app.get("/")
 def root(): return FileResponse(STATIC_DIR/"index.html")
+
+@app.get("/api/auth/status")
+def auth_status(db: Session = Depends(get_db)):
+    return {"setup_required": setup_required(db)}
+
+
+@app.post("/api/auth/setup")
+def auth_setup(payload: dict, request: Request, response: Response, db: Session = Depends(get_db)):
+    if not request.client or request.client.host not in {"127.0.0.1", "::1", "testclient"}:
+        raise HTTPException(403, "首次设置只能在服务器本机完成")
+    if not setup_required(db):
+        raise HTTPException(409, "管理员密码已设置")
+    admin = db.scalar(select(User).where(User.name == "管理员")) or db.scalar(select(User).order_by(User.id))
+    if not admin:
+        admin = User(name="管理员", role="管理员")
+        db.add(admin)
+        db.flush()
+    admin.role_id = db.scalar(select(Role.id).where(Role.name == "管理员"))
+    admin.active = True
+    admin.password_hash = hash_password(str(payload.get("password", "")))
+    db.commit()
+    token = create_session(db, admin)
+    response.set_cookie(COOKIE_NAME, token, httponly=True, samesite="strict", secure=request.url.scheme == "https",
+                        max_age=SESSION_HOURS * 3600)
+    return user_dict(admin)
+
+
+@app.post("/api/auth/login")
+def auth_login(payload: dict, request: Request, response: Response, db: Session = Depends(get_db)):
+    user = db.scalar(select(User).where(User.name == str(payload.get("name", "")).strip()))
+    if not user or not user.active or not verify_password(str(payload.get("password", "")), user.password_hash):
+        raise HTTPException(401, "用户名或密码错误")
+    token = create_session(db, user)
+    response.set_cookie(COOKIE_NAME, token, httponly=True, samesite="strict", secure=request.url.scheme == "https",
+                        max_age=SESSION_HOURS * 3600)
+    return user_dict(user)
+
+
+@app.post("/api/auth/logout")
+def auth_logout(request: Request, response: Response, db: Session = Depends(get_db)):
+    token = request.cookies.get(COOKIE_NAME)
+    if token:
+        session = db.get(LoginSession, hashlib.sha256(token.encode()).hexdigest())
+        if session:
+            db.delete(session)
+            db.commit()
+    response.delete_cookie(COOKIE_NAME, samesite="strict")
+    return {"ok": True}
+
+
+@app.get("/api/auth/me")
+def auth_me(request: Request, db: Session = Depends(get_db)):
+    return user_dict(authenticated_user(request, db))
+
+
+@app.post("/api/auth/password")
+def change_password(payload: dict, request: Request, response: Response, db: Session = Depends(get_db)):
+    user = authenticated_user(request, db)
+    if not verify_password(str(payload.get("current_password", "")), user.password_hash):
+        raise HTTPException(400, "当前密码不正确")
+    user.password_hash = hash_password(str(payload.get("new_password", "")))
+    db.query(LoginSession).filter(LoginSession.user_id == user.id).delete()
+    db.commit()
+    token = create_session(db, user)
+    response.set_cookie(COOKIE_NAME, token, httponly=True, samesite="strict", secure=request.url.scheme == "https",
+                        max_age=SESSION_HOURS * 3600)
+    return {"ok": True}
 
 @app.get("/api/config")
 def config():
@@ -106,15 +203,116 @@ def knowledge_dict(k: KnowledgeCase, issue: Issue | None=None):
 # ---- Users ----
 @app.get("/api/users")
 def list_users(db:Session=Depends(get_db)):
-    return [{"id":u.id,"name":u.name,"role":u.role} for u in db.scalars(select(User).order_by(User.id)).all()]
+    return [user_dict(u) for u in db.scalars(select(User).where(User.active.is_(True)).order_by(User.id)).all()]
 
 @app.post("/api/users")
 def create_user(payload:dict, db:Session=Depends(get_db)):
-    name=str(payload.get("name","")).strip(); role=str(payload.get("role","团队成员")).strip() or "团队成员"
+    name=str(payload.get("name","")).strip()
     if not name: raise HTTPException(400,"姓名不能为空")
+    if len(name)>80: raise HTTPException(400,"姓名不能超过 80 个字符")
     if db.scalar(select(User).where(User.name==name)): raise HTTPException(409,"用户已存在")
-    u=User(name=name,role=role); db.add(u); db.commit(); db.refresh(u)
-    return {"id":u.id,"name":u.name,"role":u.role}
+    role=db.get(Role,payload.get("role_id")) if type(payload.get("role_id")) is int else None
+    if not role: raise HTTPException(400,"请选择有效角色")
+    u=User(name=name,role=role.name,role_id=role.id,password_hash=hash_password(str(payload.get("password",""))),active=True)
+    db.add(u); db.commit(); db.refresh(u)
+    return user_dict(u)
+
+
+@app.get("/api/admin/users")
+def admin_users(db:Session=Depends(get_db)):
+    return [user_dict(u) for u in db.scalars(select(User).order_by(User.id)).all()]
+
+
+@app.patch("/api/admin/users/{user_id}")
+def update_user(user_id:int,payload:dict,request:Request,db:Session=Depends(get_db)):
+    user=db.get(User,user_id)
+    if not user: raise HTTPException(404,"用户不存在")
+    allowed={"name","role_id","active","password"}
+    if set(payload)-allowed: raise HTTPException(400,"包含不支持的用户字段")
+    if "name" in payload:
+        name=str(payload["name"]).strip()
+        if not name or len(name)>80: raise HTTPException(400,"姓名须为 1 到 80 个字符")
+        if name!=user.name and db.scalar(select(User.id).where(User.name==name)):
+            raise HTTPException(409,"用户已存在")
+        user.name=name
+    if "role_id" in payload:
+        role=db.get(Role,payload["role_id"]) if type(payload["role_id"]) is int else None
+        if not role: raise HTTPException(400,"角色不存在")
+        user.role_id=role.id; user.role=role.name
+    if "active" in payload:
+        if not isinstance(payload["active"],bool): raise HTTPException(400,"状态非法")
+        user.active=payload["active"]
+    if "password" in payload and payload["password"]:
+        user.password_hash=hash_password(str(payload["password"]))
+        db.query(LoginSession).filter(LoginSession.user_id==user.id).delete()
+    if user.id==request.state.user_id and not user.active:
+        raise HTTPException(400,"不能停用当前登录账户")
+    admin_role=db.scalar(select(Role).where(Role.name=="管理员"))
+    if user.role_id!=admin_role.id or not user.active:
+        other=db.scalar(select(User.id).where(User.id!=user.id,User.role_id==admin_role.id,User.active.is_(True)))
+        if not other and user.role_id!=admin_role.id:
+            raise HTTPException(400,"必须保留至少一名启用的管理员")
+        if not other and not user.active:
+            raise HTTPException(400,"必须保留至少一名启用的管理员")
+    db.commit(); db.refresh(user)
+    return user_dict(user)
+
+
+@app.get("/api/admin/roles")
+def list_roles(db:Session=Depends(get_db)):
+    roles=db.scalars(select(Role).order_by(Role.id)).all()
+    return [role_dict(role,db.scalar(select(func.count(User.id)).where(User.role_id==role.id)) or 0) for role in roles]
+
+
+@app.get("/api/admin/permissions")
+def list_permissions():
+    return [{"key":key,"label":label} for key,label in PERMISSIONS.items()]
+
+
+def validate_role_payload(payload:dict):
+    name=str(payload.get("name","")).strip()
+    if not name or len(name)>40: raise HTTPException(400,"角色名称须为 1 到 40 个字符")
+    description=str(payload.get("description","")).strip()
+    if len(description)>200: raise HTTPException(400,"角色说明不能超过 200 个字符")
+    permissions=payload.get("permissions",[])
+    if not isinstance(permissions,list) or any(not isinstance(p,str) or p not in PERMISSIONS for p in permissions):
+        raise HTTPException(400,"角色权限非法")
+    return name,description,sorted(set(permissions))
+
+
+@app.post("/api/admin/roles")
+def create_role(payload:dict,db:Session=Depends(get_db)):
+    name,description,permissions=validate_role_payload(payload)
+    if db.scalar(select(Role.id).where(Role.name==name)): raise HTTPException(409,"角色已存在")
+    role=Role(name=name,description=description,permissions_json=json.dumps(permissions),is_system=False)
+    db.add(role); db.commit(); db.refresh(role)
+    return role_dict(role)
+
+
+@app.patch("/api/admin/roles/{role_id}")
+def update_role(role_id:int,payload:dict,db:Session=Depends(get_db)):
+    role=db.get(Role,role_id)
+    if not role: raise HTTPException(404,"角色不存在")
+    if role.is_system: raise HTTPException(400,"内置角色不可修改")
+    name,description,permissions=validate_role_payload(payload)
+    if name!=role.name and db.scalar(select(Role.id).where(Role.name==name)):
+        raise HTTPException(409,"角色已存在")
+    role.name=name; role.description=description; role.permissions_json=json.dumps(permissions)
+    for user in db.scalars(select(User).where(User.role_id==role_id)):
+        user.role=name
+    db.commit(); db.refresh(role)
+    return role_dict(role)
+
+
+@app.delete("/api/admin/roles/{role_id}")
+def delete_role(role_id:int,db:Session=Depends(get_db)):
+    role=db.get(Role,role_id)
+    if not role: raise HTTPException(404,"角色不存在")
+    if role.is_system: raise HTTPException(400,"内置角色不可删除")
+    if db.scalar(select(User.id).where(User.role_id==role_id)):
+        raise HTTPException(409,"请先将此角色下的用户转到其他角色")
+    db.delete(role); db.commit()
+    return {"ok":True}
 
 # ---- Projects ----
 @app.get("/api/projects")
@@ -123,21 +321,26 @@ def list_projects(db:Session=Depends(get_db)):
     return [project_dict(p) for p in ps]
 
 @app.post("/api/projects")
-def create_project(payload:ProjectCreate, db:Session=Depends(get_db)):
+def create_project(payload:ProjectCreate, request:Request, db:Session=Depends(get_db)):
     if payload.current_stage not in STAGES: raise HTTPException(400,"项目阶段非法")
-    if not db.get(User,payload.manager_id): raise HTTPException(400,"项目负责人不存在")
+    manager=db.get(User,payload.manager_id)
+    if not manager or not manager.active: raise HTTPException(400,"项目负责人不存在或已停用")
     p=Project(**payload.model_dump()); db.add(p); db.flush()
-    db.add(ProjectEvent(project_id=p.id,actor_id=payload.manager_id,event_type="创建项目",content=f"创建项目：{p.name}"))
+    db.add(ProjectEvent(project_id=p.id,actor_id=request.state.user_id,event_type="创建项目",content=f"创建项目：{p.name}"))
     db.commit(); db.refresh(p)
     return project_dict(get_project(db,p.id))
 
 @app.patch("/api/projects/{project_id}")
-def patch_project(project_id:int,payload:ProjectPatch,db:Session=Depends(get_db)):
+def patch_project(project_id:int,payload:ProjectPatch,request:Request,db:Session=Depends(get_db)):
     p=db.get(Project,project_id)
     if not p: raise HTTPException(404,"项目不存在")
     data=payload.model_dump(exclude_unset=True)
     if data.get("current_stage") and data["current_stage"] not in STAGES: raise HTTPException(400,"项目阶段非法")
-    actor_id=data.pop("actor_id",None) or p.manager_id
+    if "manager_id" in data:
+        manager=db.get(User,data["manager_id"])
+        if not manager or not manager.active: raise HTTPException(400,"项目负责人不存在或已停用")
+    data.pop("actor_id",None)
+    actor_id=request.state.user_id
     changes=[]
     for k,v in data.items():
         old=getattr(p,k)
@@ -177,12 +380,14 @@ def list_issues(project_id:int|None=None,owner_id:int|None=None,status:str|None=
     return [issue_brief(i) for i in xs]
 
 @app.post("/api/issues")
-def create_issue(payload:IssueCreate,db:Session=Depends(get_db)):
+def create_issue(payload:IssueCreate,request:Request,db:Session=Depends(get_db)):
     if payload.issue_type not in ISSUE_TYPES or payload.priority not in PRIORITIES or payload.status not in ISSUE_STATUSES: raise HTTPException(400,"问题字段非法")
     if not db.get(Project,payload.project_id): raise HTTPException(400,"项目不存在")
-    if not db.get(User,payload.owner_id): raise HTTPException(400,"Owner不存在")
-    i=Issue(**payload.model_dump()); db.add(i); db.flush()
-    add_event(db,i,payload.created_by_id,"创建问题",payload.description,metadata={"issue_type":payload.issue_type,"priority":payload.priority,"owner_id":payload.owner_id})
+    owner=db.get(User,payload.owner_id)
+    if not owner or not owner.active: raise HTTPException(400,"Owner不存在或已停用")
+    data=payload.model_dump(); data["created_by_id"]=request.state.user_id
+    i=Issue(**data); db.add(i); db.flush()
+    add_event(db,i,request.state.user_id,"创建问题",payload.description,metadata={"issue_type":payload.issue_type,"priority":payload.priority,"owner_id":payload.owner_id})
     db.commit(); i=get_issue(db,i.id); ensure_issue_retro(db,i); db.commit()
     return issue_brief(i)
 
@@ -202,11 +407,14 @@ def display_value(db,field,value):
     return "" if value is None else str(value)
 
 @app.patch("/api/issues/{issue_id}")
-def patch_issue(issue_id:int,payload:IssuePatch,db:Session=Depends(get_db)):
-    i=get_issue(db,issue_id); data=payload.model_dump(exclude_unset=True); actor=data.pop("actor_id")
+def patch_issue(issue_id:int,payload:IssuePatch,request:Request,db:Session=Depends(get_db)):
+    i=get_issue(db,issue_id); data=payload.model_dump(exclude_unset=True); data.pop("actor_id",None); actor=request.state.user_id
     if data.get("issue_type") and data["issue_type"] not in ISSUE_TYPES: raise HTTPException(400,"问题类型非法")
     if data.get("priority") and data["priority"] not in PRIORITIES: raise HTTPException(400,"优先级非法")
     if data.get("status") and data["status"] not in ISSUE_STATUSES: raise HTTPException(400,"问题状态非法")
+    if "owner_id" in data:
+        owner=db.get(User,data["owner_id"])
+        if not owner or not owner.active: raise HTTPException(400,"Owner不存在或已停用")
     changes=[]
     old_status=i.status
     for field,new in data.items():
@@ -224,7 +432,8 @@ def patch_issue(issue_id:int,payload:IssuePatch,db:Session=Depends(get_db)):
     return issue_brief(i)|{"meaningful_changes":len(changes)}
 
 @app.post("/api/issues/{issue_id}/creation-attachments")
-def add_creation_attachments(issue_id:int,actor_id:int=Form(...),attachment_role:str=Form("问题证据"),files:list[UploadFile]=File(...),db:Session=Depends(get_db)):
+def add_creation_attachments(issue_id:int,request:Request,actor_id:int=Form(...),attachment_role:str=Form("问题证据"),files:list[UploadFile]=File(...),db:Session=Depends(get_db)):
+    actor_id=request.state.user_id
     i=get_issue(db,issue_id)
     e=next((e for e in i.events if e.event_type=="创建问题"),None)
     if not e: e=add_event(db,i,actor_id,"进展反馈","补充问题创建资料")
@@ -234,8 +443,9 @@ def add_creation_attachments(issue_id:int,actor_id:int=Form(...),attachment_role
     return {"attachments":[attachment_dict(a) for a in next(x for x in i.events if x.id==event_id).attachments]}
 
 @app.post("/api/issues/{issue_id}/events")
-def create_issue_event(issue_id:int,actor_id:int=Form(...),event_type:str=Form(...),content:str=Form(""),outcome:str|None=Form(None),
+def create_issue_event(issue_id:int,request:Request,actor_id:int=Form(...),event_type:str=Form(...),content:str=Form(""),outcome:str|None=Form(None),
                        attachment_role:str=Form("其他"),files:list[UploadFile]|None=File(None),db:Session=Depends(get_db)):
+    actor_id=request.state.user_id
     if event_type not in EVENT_TYPES: raise HTTPException(400,"事件类型非法")
     if outcome and outcome not in EVENT_OUTCOMES: raise HTTPException(400,"事件结果非法")
     if attachment_role not in ATTACHMENT_ROLES: raise HTTPException(400,"附件角色非法")
@@ -259,15 +469,15 @@ def regenerate_issue_retro(issue_id:int,force:bool=False,db:Session=Depends(get_
     i=get_issue(db,issue_id); r=ensure_issue_retro(db,i,force=force); db.commit(); return retro_dict(r)
 
 @app.patch("/api/issues/{issue_id}/retrospective")
-def patch_issue_retro(issue_id:int,payload:ManualRetrospectivePatch,db:Session=Depends(get_db)):
+def patch_issue_retro(issue_id:int,payload:ManualRetrospectivePatch,request:Request,db:Session=Depends(get_db)):
     i=get_issue(db,issue_id); r=ensure_issue_retro(db,i)
     locked=set(loads_list(r.locked_fields_json)); changed={}
     for field,val in payload.values.items():
         if field not in RETRO_FIELDS: continue
         old=getattr(r,field); setattr(r,field,val); locked.add(field); changed[field]={"before":old,"after":val}
     r.locked_fields_json=dumps(sorted(locked))
-    if payload.confirm: r.confirmed_by_id=payload.actor_id; r.confirmed_at=datetime.now()
-    add_event(db,i,payload.actor_id,"复盘人工修订",f"人工修订复盘字段：{', '.join(changed.keys())}",metadata={"changes":changed,"confirm":payload.confirm})
+    if payload.confirm: r.confirmed_by_id=request.state.user_id; r.confirmed_at=datetime.now()
+    add_event(db,i,request.state.user_id,"复盘人工修订",f"人工修订复盘字段：{', '.join(changed.keys())}",metadata={"changes":changed,"confirm":payload.confirm})
     k=ensure_knowledge_case(db,i,r)
     if payload.confirm and k.confidence_state=="自动提取": k.confidence_state="人工确认"
     db.commit(); return retro_dict(r)
@@ -282,13 +492,13 @@ def regenerate_project_retro(project_id:int,force:bool=False,db:Session=Depends(
     p=get_project(db,project_id); r=ensure_project_retro(db,p,force=force); db.commit(); return project_retro_dict(r)
 
 @app.patch("/api/projects/{project_id}/retrospective")
-def patch_project_retro(project_id:int,payload:ManualRetrospectivePatch,db:Session=Depends(get_db)):
+def patch_project_retro(project_id:int,payload:ManualRetrospectivePatch,request:Request,db:Session=Depends(get_db)):
     p=get_project(db,project_id); r=ensure_project_retro(db,p); locked=set(loads_list(r.locked_fields_json))
     for field,val in payload.values.items():
         if field in PROJECT_RETRO_FIELDS: setattr(r,field,val); locked.add(field)
     r.locked_fields_json=dumps(sorted(locked))
-    if payload.confirm: r.confirmed_by_id=payload.actor_id; r.confirmed_at=datetime.now()
-    db.add(ProjectEvent(project_id=project_id,actor_id=payload.actor_id,event_type="项目复盘人工修订",content=f"人工修订项目复盘字段：{', '.join(payload.values.keys())}"))
+    if payload.confirm: r.confirmed_by_id=request.state.user_id; r.confirmed_at=datetime.now()
+    db.add(ProjectEvent(project_id=project_id,actor_id=request.state.user_id,event_type="项目复盘人工修订",content=f"人工修订项目复盘字段：{', '.join(payload.values.keys())}"))
     db.commit(); return project_retro_dict(r)
 
 # ---- Knowledge ----
@@ -314,7 +524,7 @@ def get_knowledge(case_id:int,db:Session=Depends(get_db)):
     i=get_issue(db,k.issue_id); return knowledge_dict(k,i)|{"events":[event_dict(e) for e in i.events]}
 
 @app.patch("/api/knowledge/{case_id}")
-def patch_knowledge(case_id:int,payload:KnowledgePatch,db:Session=Depends(get_db)):
+def patch_knowledge(case_id:int,payload:KnowledgePatch,request:Request,db:Session=Depends(get_db)):
     k=db.get(KnowledgeCase,case_id)
     if not k: raise HTTPException(404,"知识案例不存在")
     locked=set(loads_list(k.locked_fields_json)); changed=[]
@@ -323,7 +533,7 @@ def patch_knowledge(case_id:int,payload:KnowledgePatch,db:Session=Depends(get_db
         if field=="confidence_state" and val not in KNOWLEDGE_STATES: raise HTTPException(400,"可信度状态非法")
         setattr(k,field,val); locked.add(field); changed.append(field)
     k.locked_fields_json=dumps(sorted(locked)); i=get_issue(db,k.issue_id)
-    add_event(db,i,payload.actor_id,"知识人工修订",f"人工修订知识字段：{', '.join(changed)}")
+    add_event(db,i,request.state.user_id,"知识人工修订",f"人工修订知识字段：{', '.join(changed)}")
     db.commit(); return knowledge_dict(k,i)
 
 @app.post("/api/knowledge/{case_id}/regenerate")

@@ -4,7 +4,7 @@ import StatusPill from './components/StatusPill.vue'
 import IssueTable from './components/IssueTable.vue'
 import EventTimeline from './components/EventTimeline.vue'
 
-const nav = [
+const baseNav = [
   ['workbench', '我的工作台'], ['projects', '项目'], ['issues', '问题'],
   ['stats', '统计趋势'], ['retro', '项目复盘'], ['knowledge', '知识库'],
 ]
@@ -25,6 +25,14 @@ const knowledgeFields = [
 
 const config = ref(null)
 const users = ref([])
+const authUser = ref(null)
+const authMode = ref('loading')
+const authForm = ref({ name: '', password: '' })
+const passwordForm = ref({ current_password: '', new_password: '' })
+const adminUsers = ref([])
+const roles = ref([])
+const availablePermissions = ref([])
+const roleForm = ref({ id: null, name: '', description: '', permissions: [] })
 const projects = ref([])
 const userId = ref(null)
 const page = ref('workbench')
@@ -45,7 +53,7 @@ const issueTab = ref('timeline')
 const issueFilters = ref({ project_id: '', issue_type: '', priority: '', status: '', q: '', delayed_only: false })
 const knowledgeFilters = ref({ q: '', issue_type: '', confidence_state: '' })
 const statFilters = ref({ project_id: '', days: '30' })
-const userForm = ref({ name: '', role: '团队成员' })
+const userForm = ref({ id: null, name: '', role_id: null, password: '', active: true })
 const projectForm = ref({ name: '', manager_id: '', current_stage: '需求确认', planned_completion_date: '', description: '' })
 const projectEdit = ref({ current_stage: '', planned_completion_date: '' })
 const issueForm = ref({ project_id: '', issue_type: '成像', description: '', priority: '重要不紧急', owner_id: '', planned_close_date: '', close_standard: '' })
@@ -57,12 +65,18 @@ const knowledgeValues = ref({})
 const createFiles = ref([])
 const eventFiles = ref([])
 
-const currentUser = computed(() => users.value.find((user) => user.id === userId.value) || users.value[0])
+const currentUser = computed(() => authUser.value)
+const nav = computed(() => [...baseNav, ...(can('users.manage') || can('roles.manage') ? [['admin', '用户与角色']] : [])])
+function can(permission) { return authUser.value?.permissions?.includes(permission) }
 const statsMax = computed(() => Math.max(1, ...(stats.value?.trend || []).flatMap((day) => [day.created, day.closed])))
 const evidenceCount = computed(() => (issueDetail.value?.events || []).reduce((count, event) => count + event.attachments.length, 0))
 
 async function api(url, options = {}) {
   const response = await fetch(url, options)
+  if (response.status === 401 && !url.startsWith('/api/auth/')) {
+    authUser.value = null
+    authMode.value = 'login'
+  }
   if (!response.ok) {
     let detail = await response.text()
     try { detail = JSON.parse(detail).detail || detail } catch { /* use response text */ }
@@ -111,32 +125,72 @@ async function navigate(target) {
     if (target === 'stats') await refreshStats()
     if (target === 'retro') { await refreshProjects(); projectRetro.value = null; selectedRetroProject.value = '' }
     if (target === 'knowledge') await filterKnowledge()
+    if (target === 'admin') await refreshAdmin()
   } catch (cause) { error.value = cause.message }
   finally { loading.value = false }
 }
 
 async function initialize() {
   try {
-    ;[config.value, users.value, projects.value] = await Promise.all([
-      api('/api/config'), api('/api/users'), api('/api/projects'),
-    ])
-    if (!users.value.length) {
-      await api('/api/users', jsonOptions('POST', { name: '管理员', role: '团队负责人' }))
-      users.value = await api('/api/users')
-    }
-    const saved = Number(localStorage.getItem('vision_user'))
-    userId.value = users.value.some((user) => user.id === saved) ? saved : users.value[0].id
-    await navigate('workbench')
+    const status = await api('/api/auth/status')
+    if (status.setup_required) { authMode.value = 'setup'; loading.value = false; return }
+    try { authUser.value = await api('/api/auth/me') }
+    catch { authMode.value = 'login'; loading.value = false; return }
+    await loadApp()
   } catch (cause) { error.value = `启动失败：${cause.message}`; loading.value = false }
 }
 onMounted(initialize)
 
-function changeUser() {
-  localStorage.setItem('vision_user', String(userId.value))
-  navigate(page.value)
+async function loadApp() {
+  ;[config.value, users.value, projects.value] = await Promise.all([
+    api('/api/config'), api('/api/users'), api('/api/projects'),
+  ])
+  userId.value = authUser.value.id
+  authMode.value = 'ready'
+  await navigate('workbench')
 }
 
-function openUserCreate() { userForm.value = { name: '', role: '团队成员' }; modal.value = 'userCreate' }
+async function signIn() { await act(async () => {
+  authUser.value = await api('/api/auth/login', jsonOptions('POST', authForm.value))
+  authForm.value.password = ''
+  await loadApp()
+}) }
+async function setupAdmin() { await act(async () => {
+  authUser.value = await api('/api/auth/setup', jsonOptions('POST', { password: authForm.value.password }))
+  authForm.value.password = ''
+  await loadApp()
+}) }
+async function signOut() { await act(async () => {
+  await api('/api/auth/logout', { method: 'POST' })
+  authUser.value = null; authMode.value = 'login'; modal.value = ''
+}) }
+async function changePassword() { await act(async () => {
+  await api('/api/auth/password', jsonOptions('POST', passwordForm.value))
+  passwordForm.value = { current_password: '', new_password: '' }
+  closeModal(); toast('密码已修改')
+}) }
+async function refreshAdmin() {
+  if (can('users.manage')) adminUsers.value = await api('/api/admin/users')
+  if (can('users.manage') || can('roles.manage')) {
+    ;[roles.value, availablePermissions.value] = await Promise.all([
+      api('/api/admin/roles'), api('/api/admin/permissions'),
+    ])
+  }
+}
+function openUserCreate() {
+  const member = roles.value.find((role) => role.name === '团队成员')
+  userForm.value = { id: null, name: '', role_id: member?.id || roles.value[0]?.id, password: '', active: true }
+  modal.value = 'userEdit'
+}
+function openUserEdit(user) {
+  userForm.value = { id: user.id, name: user.name, role_id: user.role_id, password: '', active: user.active }
+  modal.value = 'userEdit'
+}
+function openRoleEdit(role = null) {
+  roleForm.value = role ? { id: role.id, name: role.name, description: role.description, permissions: [...role.permissions] }
+    : { id: null, name: '', description: '', permissions: [] }
+  modal.value = 'roleEdit'
+}
 function openProjectCreate() {
   projectForm.value = { name: '', manager_id: userId.value, current_stage: config.value.stages[0], planned_completion_date: '', description: '' }
   modal.value = 'projectCreate'
@@ -151,10 +205,41 @@ function closeModal() { modal.value = ''; projectDetail.value = null; issueDetai
 function setCreateFiles(event) { createFiles.value = Array.from(event.target.files || []) }
 function setEventFiles(event) { eventFiles.value = Array.from(event.target.files || []) }
 
-async function createUser() { await act(async () => {
-  await api('/api/users', jsonOptions('POST', userForm.value))
+async function saveUser() { await act(async () => {
+  const form = { ...userForm.value, role_id: Number(userForm.value.role_id) }
+  const ownPasswordReset = form.id === userId.value && Boolean(form.password)
+  if (form.id) {
+    const id = form.id; delete form.id
+    if (!form.password) delete form.password
+    await api(`/api/admin/users/${id}`, jsonOptions('PATCH', form))
+  } else {
+    delete form.id
+    await api('/api/users', jsonOptions('POST', form))
+  }
+  if (ownPasswordReset) {
+    authUser.value = null; authMode.value = 'login'
+    closeModal(); toast('密码已修改，请重新登录')
+    return
+  }
+  if (userForm.value.id === userId.value) authUser.value = await api('/api/auth/me')
   users.value = await api('/api/users')
-  closeModal(); toast('成员已添加')
+  closeModal(); toast('用户已保存')
+  if (can('users.manage') || can('roles.manage')) await refreshAdmin()
+  else await navigate('workbench')
+}) }
+async function saveRole() { await act(async () => {
+  const form = { ...roleForm.value }; const id = form.id; delete form.id
+  await api(id ? `/api/admin/roles/${id}` : '/api/admin/roles', jsonOptions(id ? 'PATCH' : 'POST', form))
+  authUser.value = await api('/api/auth/me')
+  users.value = await api('/api/users')
+  closeModal(); toast('角色已保存')
+  if (can('users.manage') || can('roles.manage')) await refreshAdmin()
+  else await navigate('workbench')
+}) }
+async function deleteRole(role) { await act(async () => {
+  if (!window.confirm(`删除角色“${role.name}”？`)) return
+  await api(`/api/admin/roles/${role.id}`, { method: 'DELETE' })
+  await refreshAdmin(); toast('角色已删除')
 }) }
 
 async function createProject() { await act(async () => {
@@ -278,22 +363,31 @@ function downloadAgentExport() { window.open('/api/knowledge/export/agent', '_bl
 <template>
   <header>
     <div class="brand"><div class="logo">V</div><div><b>工业视觉项目与知识平台</b><small>问题驱动 · 过程留痕 · 自动复盘 · 经验沉淀</small></div></div>
-    <nav><button v-for="[key, label] in nav" :key="key" :class="{ active: page === key }" @click="navigate(key)">{{ label }}</button></nav>
-    <div class="userbox" v-if="currentUser"><span>当前用户</span><select v-model.number="userId" aria-label="当前用户" @change="changeUser"><option v-for="user in users" :key="user.id" :value="user.id">{{ user.name }}</option></select><button class="primary" @click="openIssueCreate">＋ 新增问题</button></div>
+    <nav v-if="authUser"><button v-for="[key, label] in nav" :key="key" :class="{ active: page === key }" @click="navigate(key)">{{ label }}</button></nav>
+    <div class="userbox" v-if="currentUser"><span>{{ currentUser.name }} · {{ currentUser.role }}</span><button v-if="can('issues.write')" class="primary" @click="openIssueCreate">＋ 新增问题</button><button class="secondary" @click="modal = 'passwordChange'">修改密码</button><button class="secondary" @click="signOut">退出</button></div>
   </header>
 
   <main>
-    <div v-if="loading" class="loading">加载中…</div>
+    <div v-if="authMode === 'setup' || authMode === 'login'" class="auth-card panel">
+      <h1>{{ authMode === 'setup' ? '首次设置管理员密码' : '登录' }}</h1>
+      <p class="muted">{{ authMode === 'setup' ? '请在服务器本机完成设置。密码至少 12 个字符，设置后由管理员为其他成员分配账户。' : '使用管理员分配的姓名和密码登录。' }}</p>
+      <form class="form" @submit.prevent="authMode === 'setup' ? setupAdmin() : signIn()">
+        <label v-if="authMode === 'login'">姓名<input v-model="authForm.name" autocomplete="username" required /></label>
+        <label>密码<input v-model="authForm.password" type="password" :autocomplete="authMode === 'setup' ? 'new-password' : 'current-password'" :minlength="authMode === 'setup' ? 12 : 1" required /></label>
+        <button class="primary">{{ authMode === 'setup' ? '设置并登录' : '登录' }}</button>
+      </form>
+    </div>
+    <div v-else-if="loading" class="loading">加载中…</div>
     <div v-else-if="error" class="empty">{{ error }}</div>
 
     <template v-else-if="page === 'workbench' && workbench">
-      <div class="page-head"><div><h1>{{ currentUser?.name }}的工作台</h1><p>只看需要你处理的事，项目管理和复盘由系统自动生成。</p></div><div class="toolbar"><button class="secondary" @click="openUserCreate">＋ 成员</button><button class="secondary" @click="openProjectCreate">＋ 项目</button></div></div>
+      <div class="page-head"><div><h1>{{ currentUser?.name }}的工作台</h1><p>只看需要你处理的事，项目管理和复盘由系统自动生成。</p></div><div class="toolbar"><button v-if="can('users.manage')" class="secondary" @click="navigate('admin')">用户与角色</button><button v-if="can('projects.write')" class="secondary" @click="openProjectCreate">＋ 项目</button></div></div>
       <div class="cards"><div v-for="[label, count] in [['我的未关闭', workbench.counts.all], ['紧急重要', workbench.counts.critical], ['阻塞', workbench.counts.blocked], ['本周到期', workbench.counts.due_week], ['已延期', workbench.counts.delayed]]" :key="label" class="card metric"><span>{{ label }}</span><b>{{ count }}</b></div></div>
       <div class="panel"><div class="panel-head"><h2>我的问题</h2><span class="muted">优先显示紧急 / 阻塞 / 临期</span></div><IssueTable :issues="workbench.issues" @open="openIssue" /></div>
     </template>
 
     <template v-else-if="page === 'projects'">
-      <div class="page-head"><div><h1>项目总览</h1><p>项目状态由未关闭问题自动推导，减少重复维护。</p></div><button class="primary" @click="openProjectCreate">＋ 新建项目</button></div>
+      <div class="page-head"><div><h1>项目总览</h1><p>项目状态由未关闭问题自动推导，减少重复维护。</p></div><button v-if="can('projects.write')" class="primary" @click="openProjectCreate">＋ 新建项目</button></div>
       <div class="panel table-wrap"><table><thead><tr><th>项目</th><th>负责人</th><th>阶段</th><th>总体状态</th><th>计划完成</th><th>未关闭</th><th>紧急重要</th><th>阻塞</th><th>延期</th></tr></thead><tbody>
         <tr v-for="project in projects" :key="project.id" class="clickable" @click="openProject(project.id)"><td><b>{{ project.name }}</b></td><td>{{ project.manager_name }}</td><td><StatusPill :value="project.current_stage" /></td><td><StatusPill :value="project.overall_status" /></td><td>{{ date(project.planned_completion_date) }}</td><td>{{ project.counts.open }}</td><td>{{ project.counts.critical }}</td><td>{{ project.counts.blocked }}</td><td>{{ project.counts.delayed }}</td></tr>
         <tr v-if="!projects.length"><td colspan="9" class="empty">暂无项目</td></tr>
@@ -316,7 +410,7 @@ function downloadAgentExport() { window.open('/api/knowledge/export/agent', '_bl
     <template v-else-if="page === 'retro'">
       <div class="page-head"><div><h1>项目复盘</h1><p>问题复盘在处理过程中自动积累，项目复盘直接汇总。</p></div><select v-model="selectedRetroProject" aria-label="选择复盘项目" @change="loadProjectRetro"><option value="">选择项目</option><option v-for="project in projects" :key="project.id" :value="project.id">{{ project.name }}</option></select></div>
       <div v-if="!projectRetro" class="empty">请选择一个项目</div>
-      <template v-else><div class="cards"><div v-for="[label, count] in [['未关闭', projectRetro.project.counts.open], ['紧急重要', projectRetro.project.counts.critical], ['阻塞', projectRetro.project.counts.blocked], ['延期', projectRetro.project.counts.delayed], ['阶段', projectRetro.project.current_stage]]" :key="label" class="card metric"><span>{{ label }}</span><b>{{ count }}</b></div></div><div class="panel"><div class="panel-head"><h2>自动生成 + 人工修订</h2><div class="toolbar"><button class="secondary" @click="regenerateProjectRetro">重新自动提取</button><button class="primary" @click="saveProjectRetro">保存并确认</button></div></div><div class="retro-fields"><div v-for="[key, label] in projectRetroFields" :key="key" class="retro-field"><label>{{ label }}<span :class="{ locked: projectRetro.retrospective.locked_fields.includes(key) }">{{ projectRetro.retrospective.locked_fields.includes(key) ? '人工内容已锁定' : '自动提取' }}</span></label><textarea v-model="projectRetroValues[key]" :aria-label="label"></textarea></div></div></div></template>
+      <template v-else><div class="cards"><div v-for="[label, count] in [['未关闭', projectRetro.project.counts.open], ['紧急重要', projectRetro.project.counts.critical], ['阻塞', projectRetro.project.counts.blocked], ['延期', projectRetro.project.counts.delayed], ['阶段', projectRetro.project.current_stage]]" :key="label" class="card metric"><span>{{ label }}</span><b>{{ count }}</b></div></div><div class="panel"><div class="panel-head"><h2>自动生成 + 人工修订</h2><div v-if="can('projects.write')" class="toolbar"><button class="secondary" @click="regenerateProjectRetro">重新自动提取</button><button class="primary" @click="saveProjectRetro">保存并确认</button></div></div><div class="retro-fields"><div v-for="[key, label] in projectRetroFields" :key="key" class="retro-field"><label>{{ label }}<span :class="{ locked: projectRetro.retrospective.locked_fields.includes(key) }">{{ projectRetro.retrospective.locked_fields.includes(key) ? '人工内容已锁定' : '自动提取' }}</span></label><textarea v-model="projectRetroValues[key]" :aria-label="label" :readonly="!can('projects.write')"></textarea></div></div></div></template>
     </template>
 
     <template v-else-if="page === 'knowledge'">
@@ -324,19 +418,37 @@ function downloadAgentExport() { window.open('/api/knowledge/export/agent', '_bl
       <form class="toolbar filters" @submit.prevent="act(filterKnowledge)"><input v-model="knowledgeFilters.q" placeholder="搜索问题/根因/方案/标签" /><select v-model="knowledgeFilters.issue_type" aria-label="知识类型"><option value="">全部类型</option><option v-for="item in config.issue_types" :key="item">{{ item }}</option></select><select v-model="knowledgeFilters.confidence_state" aria-label="知识可信度"><option value="">全部可信度</option><option v-for="item in config.knowledge_states" :key="item">{{ item }}</option></select><button class="secondary">搜索</button></form>
       <div class="panel"><div v-for="item in knowledge" :key="item.id" class="knowledge-card" @click="openKnowledge(item.id)"><h3>{{ item.title }} <StatusPill :value="item.confidence_state" /></h3><p><b>根因：</b>{{ (item.root_cause || '').slice(0, 180) }}</p><p><b>最终方案：</b>{{ (item.final_solution || '').slice(0, 180) }}</p><p class="muted">{{ item.project_name }} · 证据{{ item.evidence_count }}份 · {{ item.tags }}</p></div><div v-if="!knowledge.length" class="empty">知识案例会随着问题处理自动产生</div></div>
     </template>
+
+    <template v-else-if="page === 'admin'">
+      <div class="page-head"><div><h1>用户与角色</h1><p>停用用户会保留项目、问题和操作历史；内置角色不可修改。</p></div></div>
+      <div v-if="can('users.manage')" class="panel">
+        <div class="panel-head"><h2>用户</h2><button class="primary" @click="openUserCreate">＋ 新增用户</button></div>
+        <div class="table-wrap"><table><thead><tr><th>姓名 / 登录名</th><th>角色</th><th>状态</th><th>操作</th></tr></thead><tbody>
+          <tr v-for="user in adminUsers" :key="user.id"><td>{{ user.name }}</td><td>{{ user.role }}</td><td>{{ !user.active ? '停用' : user.has_password ? '启用' : '待设置密码' }}</td><td><button class="secondary" @click="openUserEdit(user)">编辑 / 重置密码</button></td></tr>
+        </tbody></table></div>
+      </div>
+      <div v-if="can('roles.manage')" class="panel">
+        <div class="panel-head"><h2>角色与权限</h2><button class="primary" @click="openRoleEdit()">＋ 新增角色</button></div>
+        <div class="table-wrap"><table><thead><tr><th>角色</th><th>说明</th><th>权限</th><th>人数</th><th>操作</th></tr></thead><tbody>
+          <tr v-for="role in roles" :key="role.id"><td><b>{{ role.name }}</b><span v-if="role.is_system" class="muted"> · 内置</span></td><td>{{ role.description }}</td><td>{{ role.permissions.map((key) => availablePermissions.find((item) => item.key === key)?.label || key).join('、') || '仅查看' }}</td><td>{{ role.user_count }}</td><td><template v-if="!role.is_system"><button class="secondary" @click="openRoleEdit(role)">编辑</button> <button class="secondary danger" @click="deleteRole(role)">删除</button></template></td></tr>
+        </tbody></table></div>
+      </div>
+    </template>
   </main>
 
   <div v-if="modal" class="modal" @click.self="closeModal"><div class="modal-card"><button class="close" aria-label="关闭" @click="closeModal">×</button>
-    <template v-if="modal === 'userCreate'"><h2>添加成员</h2><form class="form" @submit.prevent="createUser"><label>姓名<input v-model="userForm.name" required /></label><label>角色<input v-model="userForm.role" /></label><button class="primary">添加</button></form></template>
+    <template v-if="modal === 'userEdit'"><h2>{{ userForm.id ? '编辑用户' : '新增用户' }}</h2><form class="form" @submit.prevent="saveUser"><label>姓名 / 登录名<input v-model="userForm.name" maxlength="80" required /></label><label>角色<select v-model.number="userForm.role_id" required><option v-for="role in roles" :key="role.id" :value="role.id">{{ role.name }}</option></select></label><label>密码{{ userForm.id ? '（留空则不修改）' : '' }}<input v-model="userForm.password" type="password" autocomplete="new-password" :required="!userForm.id" :minlength="userForm.password ? 12 : undefined" /></label><label v-if="userForm.id" class="check-row"><input v-model="userForm.active" type="checkbox" /> 启用此用户</label><button class="primary">保存用户</button></form></template>
+    <template v-else-if="modal === 'roleEdit'"><h2>{{ roleForm.id ? '编辑角色' : '新增角色' }}</h2><form class="form" @submit.prevent="saveRole"><label>角色名称<input v-model="roleForm.name" maxlength="40" required /></label><label>说明<input v-model="roleForm.description" maxlength="200" /></label><div class="permission-options"><b>操作权限</b><label v-for="permission in availablePermissions" :key="permission.key" class="check-row"><input v-model="roleForm.permissions" type="checkbox" :value="permission.key" /> {{ permission.label }}</label></div><button class="primary">保存角色</button></form></template>
+    <template v-else-if="modal === 'passwordChange'"><h2>修改密码</h2><form class="form" @submit.prevent="changePassword"><label>当前密码<input v-model="passwordForm.current_password" type="password" autocomplete="current-password" required /></label><label>新密码（至少 12 个字符）<input v-model="passwordForm.new_password" type="password" autocomplete="new-password" minlength="12" required /></label><button class="primary">保存新密码</button></form></template>
     <template v-else-if="modal === 'projectCreate'"><h2>新建项目</h2><form class="form" @submit.prevent="createProject"><label>项目名称<input v-model="projectForm.name" required /></label><div class="form-row"><label>项目负责人<select v-model="projectForm.manager_id"><option v-for="user in users" :key="user.id" :value="user.id">{{ user.name }}</option></select></label><label>当前阶段<select v-model="projectForm.current_stage"><option v-for="item in config.stages" :key="item">{{ item }}</option></select></label></div><label>总体计划完成时间<input v-model="projectForm.planned_completion_date" type="date" required /></label><label>项目说明<textarea v-model="projectForm.description"></textarea></label><button class="primary">创建</button></form></template>
     <template v-else-if="modal === 'issueCreate'"><h2>快速新增问题</h2><p class="muted">只填写必要信息；图片/视频可直接一起上传。</p><form class="form" @submit.prevent="createIssue"><div class="form-row"><label>项目<select v-model="issueForm.project_id"><option v-for="project in projects" :key="project.id" :value="project.id">{{ project.name }}</option></select></label><label>问题类型<select v-model="issueForm.issue_type"><option v-for="item in config.issue_types" :key="item">{{ item }}</option></select></label></div><label>问题描述<textarea v-model="issueForm.description" required placeholder="把现场真正需要解决的事写清楚…"></textarea></label><div class="form-row"><label>优先级<select v-model="issueForm.priority"><option v-for="item in config.priorities" :key="item">{{ item }}</option></select></label><label>问题Owner<select v-model="issueForm.owner_id"><option v-for="user in users" :key="user.id" :value="user.id">{{ user.name }}</option></select></label></div><div class="form-row"><label>计划关闭时间<input v-model="issueForm.planned_close_date" type="date" required /></label><label>关闭标准（可后补）<input v-model="issueForm.close_standard" placeholder="怎样证明问题真的解决" /></label></div><label>问题证据（可选）<input type="file" multiple accept="image/*,video/*,.log,.txt,.csv,.xlsx,.zip" @change="setCreateFiles" /></label><button class="primary">保存问题</button></form></template>
-    <template v-else-if="modal === 'project' && projectDetail"><h2>{{ projectDetail.name }}</h2><div class="cards"><div v-for="[label, count] in [['状态', projectDetail.overall_status], ['阶段', projectDetail.current_stage], ['未关闭', projectDetail.counts.open], ['阻塞', projectDetail.counts.blocked], ['延期', projectDetail.counts.delayed]]" :key="label" class="card metric"><span>{{ label }}</span><b>{{ count }}</b></div></div><div class="form-row project-edit"><label>当前阶段<select v-model="projectEdit.current_stage"><option v-for="item in config.stages" :key="item">{{ item }}</option></select></label><label>计划完成时间<input v-model="projectEdit.planned_completion_date" type="date" /></label></div><button class="secondary" @click="saveProject">保存项目状态</button><h3>问题</h3><div class="table-wrap"><table><thead><tr><th>类型</th><th>问题</th><th>优先级</th><th>状态</th><th>Owner</th><th>关闭时间</th></tr></thead><tbody><tr v-for="issue in projectDetail.issues" :key="issue.id" class="clickable" @click="openIssue(issue.id)"><td><StatusPill :value="issue.issue_type" /></td><td>{{ issue.description }}</td><td><StatusPill :value="issue.priority" /></td><td><StatusPill :value="issue.status" /></td><td>{{ issue.owner_name }}</td><td>{{ date(issue.planned_close_date) }}</td></tr><tr v-if="!projectDetail.issues.length"><td colspan="6" class="empty">暂无问题</td></tr></tbody></table></div></template>
+    <template v-else-if="modal === 'project' && projectDetail"><h2>{{ projectDetail.name }}</h2><div class="cards"><div v-for="[label, count] in [['状态', projectDetail.overall_status], ['阶段', projectDetail.current_stage], ['未关闭', projectDetail.counts.open], ['阻塞', projectDetail.counts.blocked], ['延期', projectDetail.counts.delayed]]" :key="label" class="card metric"><span>{{ label }}</span><b>{{ count }}</b></div></div><div v-if="can('projects.write')" class="form-row project-edit"><label>当前阶段<select v-model="projectEdit.current_stage"><option v-for="item in config.stages" :key="item">{{ item }}</option></select></label><label>计划完成时间<input v-model="projectEdit.planned_completion_date" type="date" /></label></div><button v-if="can('projects.write')" class="secondary" @click="saveProject">保存项目状态</button><h3>问题</h3><div class="table-wrap"><table><thead><tr><th>类型</th><th>问题</th><th>优先级</th><th>状态</th><th>Owner</th><th>关闭时间</th></tr></thead><tbody><tr v-for="issue in projectDetail.issues" :key="issue.id" class="clickable" @click="openIssue(issue.id)"><td><StatusPill :value="issue.issue_type" /></td><td>{{ issue.description }}</td><td><StatusPill :value="issue.priority" /></td><td><StatusPill :value="issue.status" /></td><td>{{ issue.owner_name }}</td><td>{{ date(issue.planned_close_date) }}</td></tr><tr v-if="!projectDetail.issues.length"><td colspan="6" class="empty">暂无问题</td></tr></tbody></table></div></template>
     <template v-else-if="modal === 'issue' && issueDetail"><h2>{{ issueDetail.description }}</h2><p class="muted">{{ issueDetail.project_name }} · <StatusPill :value="issueDetail.issue_type" /> <StatusPill :value="issueDetail.priority" /> <StatusPill :value="issueDetail.status" /> <StatusPill v-if="issueDetail.is_delayed" :value="`延期${issueDetail.delay_days}天`" /></p><div class="tabs"><button v-for="[key, label] in [['timeline', '处理时间线'], ['retro', '问题复盘'], ['knowledge', '知识案例']]" :key="key" :class="{ active: issueTab === key }" @click="issueTab = key">{{ label }}</button></div>
-      <div v-if="issueTab === 'timeline'" class="grid2"><div><div class="quick-event"><b>随手反馈</b><div class="form-row"><select v-model="eventForm.event_type" aria-label="反馈类型"><option v-for="item in config.event_types" :key="item">{{ item }}</option></select><select v-model="eventForm.outcome" aria-label="反馈结果"><option value="">结果（可选）</option><option v-for="item in config.event_outcomes" :key="item">{{ item }}</option></select></div><textarea v-model="eventForm.content" placeholder="进展、尝试、判断、验证结果…"></textarea><input type="file" multiple accept="image/*,video/*,.log,.txt,.csv,.xlsx,.zip" @change="setEventFiles" /><p class="file-hint">附件角色会按反馈类型自动归类。</p><button class="primary" @click="addEvent">提交反馈</button></div><EventTimeline :events="issueDetail.events" /></div><div><div class="panel"><div class="panel-head"><h2>问题属性</h2></div><div class="form issue-core"><label>状态<select v-model="issueCore.status"><option v-for="item in config.issue_statuses" :key="item">{{ item }}</option></select></label><label>优先级<select v-model="issueCore.priority"><option v-for="item in config.priorities" :key="item">{{ item }}</option></select></label><label>问题Owner<select v-model="issueCore.owner_id"><option v-for="user in users" :key="user.id" :value="user.id">{{ user.name }}</option></select></label><label>计划关闭<input v-model="issueCore.planned_close_date" type="date" /></label><label>关闭标准<textarea v-model="issueCore.close_standard"></textarea></label><label>延期原因<textarea v-model="issueCore.delay_reason"></textarea></label><button class="secondary" @click="saveIssueCore">保存有意义变更</button></div></div><div class="card"><b>系统自动沉淀</b><p class="muted">当前已有 {{ issueDetail.events.length }} 条事件记录、{{ evidenceCount }} 份多模态证据。</p></div></div></div>
-      <div v-else-if="issueTab === 'retro'" class="panel"><div class="panel-head"><h2>伴随式问题复盘</h2><div class="toolbar"><button class="secondary" @click="regenerateIssueRetro">重新自动提取</button><button class="primary" @click="saveIssueRetro">保存并确认</button></div></div><div class="retro-fields"><div v-for="[key, label] in issueRetroFields" :key="key" class="retro-field"><label>{{ label }}<span :class="{ locked: issueDetail.retrospective.locked_fields.includes(key) }">{{ issueDetail.retrospective.locked_fields.includes(key) ? '人工内容已锁定' : '自动提取' }}</span></label><textarea v-model="issueRetroValues[key]" :aria-label="label"></textarea></div></div></div>
-      <div v-else class="card knowledge-detail"><h3>{{ issueDetail.knowledge.title }} <StatusPill :value="issueDetail.knowledge.confidence_state" /></h3><p v-for="[key, label] in knowledgeFields.filter(([key]) => key !== 'title' && key !== 'tags')" :key="key"><b>{{ label }}：</b>{{ issueDetail.knowledge[key] }}</p><p class="muted">证据 {{ issueDetail.knowledge.evidence_count }} 份 · 标签 {{ issueDetail.knowledge.tags }}</p><button class="secondary" @click="openKnowledge(issueDetail.knowledge.id)">编辑知识案例</button></div>
+      <div v-if="issueTab === 'timeline'" class="grid2"><div><div v-if="can('issues.write')" class="quick-event"><b>随手反馈</b><div class="form-row"><select v-model="eventForm.event_type" aria-label="反馈类型"><option v-for="item in config.event_types" :key="item">{{ item }}</option></select><select v-model="eventForm.outcome" aria-label="反馈结果"><option value="">结果（可选）</option><option v-for="item in config.event_outcomes" :key="item">{{ item }}</option></select></div><textarea v-model="eventForm.content" placeholder="进展、尝试、判断、验证结果…"></textarea><input type="file" multiple accept="image/*,video/*,.log,.txt,.csv,.xlsx,.zip" @change="setEventFiles" /><p class="file-hint">附件角色会按反馈类型自动归类。</p><button class="primary" @click="addEvent">提交反馈</button></div><EventTimeline :events="issueDetail.events" /></div><div><div v-if="can('issues.write')" class="panel"><div class="panel-head"><h2>问题属性</h2></div><div class="form issue-core"><label>状态<select v-model="issueCore.status"><option v-for="item in config.issue_statuses" :key="item">{{ item }}</option></select></label><label>优先级<select v-model="issueCore.priority"><option v-for="item in config.priorities" :key="item">{{ item }}</option></select></label><label>问题Owner<select v-model="issueCore.owner_id"><option v-for="user in users" :key="user.id" :value="user.id">{{ user.name }}</option></select></label><label>计划关闭<input v-model="issueCore.planned_close_date" type="date" /></label><label>关闭标准<textarea v-model="issueCore.close_standard"></textarea></label><label>延期原因<textarea v-model="issueCore.delay_reason"></textarea></label><button class="secondary" @click="saveIssueCore">保存有意义变更</button></div></div><div class="card"><b>系统自动沉淀</b><p class="muted">当前已有 {{ issueDetail.events.length }} 条事件记录、{{ evidenceCount }} 份多模态证据。</p></div></div></div>
+      <div v-else-if="issueTab === 'retro'" class="panel"><div class="panel-head"><h2>伴随式问题复盘</h2><div v-if="can('issues.write')" class="toolbar"><button class="secondary" @click="regenerateIssueRetro">重新自动提取</button><button class="primary" @click="saveIssueRetro">保存并确认</button></div></div><div class="retro-fields"><div v-for="[key, label] in issueRetroFields" :key="key" class="retro-field"><label>{{ label }}<span :class="{ locked: issueDetail.retrospective.locked_fields.includes(key) }">{{ issueDetail.retrospective.locked_fields.includes(key) ? '人工内容已锁定' : '自动提取' }}</span></label><textarea v-model="issueRetroValues[key]" :aria-label="label" :readonly="!can('issues.write')"></textarea></div></div></div>
+      <div v-else class="card knowledge-detail"><h3>{{ issueDetail.knowledge.title }} <StatusPill :value="issueDetail.knowledge.confidence_state" /></h3><p v-for="[key, label] in knowledgeFields.filter(([key]) => key !== 'title' && key !== 'tags')" :key="key"><b>{{ label }}：</b>{{ issueDetail.knowledge[key] }}</p><p class="muted">证据 {{ issueDetail.knowledge.evidence_count }} 份 · 标签 {{ issueDetail.knowledge.tags }}</p><button v-if="can('knowledge.write')" class="secondary" @click="openKnowledge(issueDetail.knowledge.id)">编辑知识案例</button></div>
     </template>
-    <template v-else-if="modal === 'knowledge' && knowledgeDetail"><h2>知识案例</h2><p><StatusPill :value="knowledgeDetail.confidence_state" /> · 证据{{ knowledgeDetail.evidence_count }}份</p><div class="form"><label v-for="[key, label] in knowledgeFields" :key="key">{{ label }}<span v-if="knowledgeDetail.locked_fields.includes(key)" class="locked">人工锁定</span><textarea v-model="knowledgeValues[key]"></textarea></label><label>可信度<select v-model="knowledgeValues.confidence_state"><option v-for="item in config.knowledge_states" :key="item">{{ item }}</option></select></label><button class="primary" @click="saveKnowledge">保存人工修订</button></div><h3>原始处理证据</h3><EventTimeline :events="knowledgeDetail.events" /></template>
+    <template v-else-if="modal === 'knowledge' && knowledgeDetail"><h2>知识案例</h2><p><StatusPill :value="knowledgeDetail.confidence_state" /> · 证据{{ knowledgeDetail.evidence_count }}份</p><div class="form"><label v-for="[key, label] in knowledgeFields" :key="key">{{ label }}<span v-if="knowledgeDetail.locked_fields.includes(key)" class="locked">人工锁定</span><textarea v-model="knowledgeValues[key]" :readonly="!can('knowledge.write')"></textarea></label><label>可信度<select v-model="knowledgeValues.confidence_state" :disabled="!can('knowledge.write')"><option v-for="item in config.knowledge_states" :key="item">{{ item }}</option></select></label><button v-if="can('knowledge.write')" class="primary" @click="saveKnowledge">保存人工修订</button></div><h3>原始处理证据</h3><EventTimeline :events="knowledgeDetail.events" /></template>
   </div></div>
   <div id="toast" :class="{ show: message }" role="status">{{ message }}</div>
 </template>

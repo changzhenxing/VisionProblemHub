@@ -10,7 +10,25 @@ class User(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     name: Mapped[str] = mapped_column(String(80), unique=True, index=True)
     role: Mapped[str] = mapped_column(String(40), default="团队成员")
+    role_id: Mapped[Optional[int]] = mapped_column(ForeignKey("roles.id"), nullable=True)
+    password_hash: Mapped[Optional[str]] = mapped_column(String(256), nullable=True)
+    active: Mapped[bool] = mapped_column(Boolean, default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
+    assigned_role: Mapped[Optional[Role]] = relationship(foreign_keys=[role_id])
+
+class Role(Base):
+    __tablename__ = "roles"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    name: Mapped[str] = mapped_column(String(40), unique=True)
+    description: Mapped[str] = mapped_column(String(200), default="")
+    permissions_json: Mapped[str] = mapped_column(Text, default="[]")
+    is_system: Mapped[bool] = mapped_column(Boolean, default=False)
+
+class LoginSession(Base):
+    __tablename__ = "login_sessions"
+    token_hash: Mapped[str] = mapped_column(String(64), primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    expires_at: Mapped[datetime] = mapped_column(DateTime, index=True)
 
 class Project(Base):
     __tablename__ = "projects"

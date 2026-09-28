@@ -5,9 +5,14 @@ from app.main import app
 from app.db import engine
 
 client=TestClient(app)
+remote=TestClient(app, client=('192.0.2.10', 1234))
+assert remote.post('/api/auth/setup',json={'password':'TestPassword123!'}).status_code==403
+assert client.post('/api/auth/setup',json={'password':'TestPassword123!'},headers={'Origin':'http://evil.example'}).status_code==403
+assert client.post('/api/auth/setup',json={'password':'TestPassword123!'}).status_code==200
+ROLE_ID=next(role['id'] for role in client.get('/api/admin/roles').json() if role['name']=='团队成员')
 
 def post_user(name):
-    r=client.post('/api/users',json={'name':name,'role':'工程师'}); assert r.status_code==200; return r.json()['id']
+    r=client.post('/api/users',json={'name':name,'role_id':ROLE_ID,'password':'TestPassword123!'}); assert r.status_code==200; return r.json()['id']
 
 def setup_base():
     u1=post_user('张三');u2=post_user('李四')
@@ -47,6 +52,7 @@ def test_full_problem_to_knowledge_flow(tmp_path):
     assert detail['knowledge']['evidence_count']==3
     assert '增加偏振片' in detail['knowledge']['final_solution']
     assert len(detail['events'])>=6
+    assert detail['events'][0]['actor_name']=='管理员'
 
 
 def test_manual_retro_is_preserved_and_correction_logged():
@@ -126,3 +132,61 @@ def test_attachment_is_served_and_knowledge_manual_lock_survives_regeneration():
     assert r.status_code==200
     client.post(f'/api/knowledge/{kid}/regenerate')
     k=client.get(f'/api/knowledge/{kid}').json(); assert k['applicability'].startswith('适用于高反') and k['confidence_state']=='人工确认'
+
+
+def test_login_and_role_permissions():
+    guest=TestClient(app)
+    assert guest.get('/api/projects').status_code==401
+    assert guest.get('/api/admin/users').status_code==401
+    assert guest.get('/uploads/anything').status_code==401
+    assert guest.post('/api/auth/login',json={'name':'管理员','password':'wrong'}).status_code==401
+    assert guest.post('/api/auth/login',json={'name':'管理员','password':'TestPassword123!'},headers={'Origin':'http://evil.example'}).status_code==403
+
+    roles=client.get('/api/admin/roles').json()
+    viewer_role=next(role for role in roles if role['name']=='只读成员')
+    created=client.post('/api/users',json={'name':'只读测试员','role_id':viewer_role['id'],'password':'ViewerPassword123!'})
+    assert created.status_code==200
+    viewer_id=created.json()['id']
+    assert guest.post('/api/auth/login',json={'name':'只读测试员','password':'ViewerPassword123!'}).status_code==200
+    assert guest.get('/api/projects').status_code==200
+    assert guest.get('/api/admin/roles').status_code==403
+    assert guest.post('/api/issues',json={}).status_code==403
+    assert guest.post('/api/projects',json={}).status_code==403
+    assert guest.patch('/api/knowledge/1',json={}).status_code==403
+    assert guest.post('/api/users',json={}).status_code==403
+
+    role=client.post('/api/admin/roles',json={'name':'项目观察员','description':'审阅项目','permissions':[]})
+    assert role.status_code==200
+    role_id=role.json()['id']
+    observer=client.post('/api/users',json={'name':'观察员','role_id':role_id,'password':'ObserverPassword123!'})
+    assert observer.status_code==200
+    assert client.delete(f'/api/admin/roles/{role_id}').status_code==409
+    observer_client=TestClient(app)
+    assert observer_client.post('/api/auth/login',json={'name':'观察员','password':'ObserverPassword123!'}).status_code==200
+    assert observer_client.post('/api/issues',json={}).status_code==403
+    assert client.patch(f'/api/admin/roles/{role_id}',json={'name':'项目观察员','description':'可处理问题','permissions':['issues.write']}).status_code==200
+    assert observer_client.post('/api/issues',json={}).status_code!=403
+    member_role=next(role for role in roles if role['name']=='团队成员')
+    assert client.patch(f"/api/admin/users/{observer.json()['id']}",json={'role_id':member_role['id']}).status_code==200
+    assert client.delete(f'/api/admin/roles/{role_id}').status_code==200
+    assert observer_client.post('/api/auth/logout').status_code==200
+    assert observer_client.get('/api/projects').status_code==401
+    assert client.delete(f"/api/admin/roles/{viewer_role['id']}").status_code==400
+    assert client.patch(f'/api/admin/users/{viewer_id}',json={'active':False}).status_code==200
+    assert guest.get('/api/projects').status_code==401
+    assert guest.post('/api/auth/login',json={'name':'只读测试员','password':'ViewerPassword123!'}).status_code==401
+    assert client.patch('/api/admin/users/1',json={'active':False}).status_code==400
+    assert client.post('/api/admin/roles',json={'name':'坏角色','permissions':[{}]}).status_code==400
+    reset=client.post('/api/users',json={'name':'重置测试员','role_id':viewer_role['id'],'password':'OldPassword123!'})
+    reset_client=TestClient(app)
+    assert reset_client.post('/api/auth/login',json={'name':'重置测试员','password':'OldPassword123!'}).status_code==200
+    assert client.patch(f"/api/admin/users/{reset.json()['id']}",json={'password':'NewPassword123!'}).status_code==200
+    assert reset_client.get('/api/projects').status_code==401
+    assert reset_client.post('/api/auth/login',json={'name':'重置测试员','password':'OldPassword123!'}).status_code==401
+    assert reset_client.post('/api/auth/login',json={'name':'重置测试员','password':'NewPassword123!'}).status_code==200
+    second_session=TestClient(app)
+    assert second_session.post('/api/auth/login',json={'name':'重置测试员','password':'NewPassword123!'}).status_code==200
+    assert reset_client.post('/api/auth/password',json={'current_password':'wrong','new_password':'LastPassword123!'}).status_code==400
+    assert reset_client.post('/api/auth/password',json={'current_password':'NewPassword123!','new_password':'LastPassword123!'}).status_code==200
+    assert reset_client.get('/api/projects').status_code==200
+    assert second_session.get('/api/projects').status_code==401
