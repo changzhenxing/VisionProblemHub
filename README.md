@@ -19,7 +19,7 @@
 - FastAPI
 - SQLAlchemy
 - SQLite + WAL
-- 原生 HTML/CSS/JavaScript（无前端构建依赖）
+- Vue 3 + Vite（前端源码在 `frontend/`，构建产物在 `app/static/`）
 - 本地文件系统保存图片、视频和附件
 
 面向 10 人左右局域网团队的第一阶段原型。当前尚无身份认证和角色权限控制，正式团队部署前需补齐。数据库访问层已隔离，未来可迁移 PostgreSQL。
@@ -32,6 +32,16 @@
 4. 局域网成员访问 `http://服务器IP:8000`
 
 首次启动会自动创建默认用户 `管理员`，进入系统后可添加团队成员和项目。
+
+仓库已包含构建好的前端页面，普通部署仍只需 Python。修改前端时需要 Node.js 22.18+ 或 24.12+：
+
+```bash
+cd frontend
+npm ci
+npm run build
+```
+
+开发时可运行 `npm run dev`，Vite 会将 `/api` 和 `/uploads` 代理到本机 8000 端口的 FastAPI。构建会更新 `app/static/`，提交前端改动时需同时提交构建产物。
 
 ## 日常使用
 
@@ -61,7 +71,8 @@ python -m pytest -q
 
 ## 关键目录
 
-- `app/` 后端和前端
+- `app/` 后端与前端构建产物
+- `frontend/` Vue 源码与 Vite 配置
 - `data/vision_knowledge.db` 数据库
 - `data/uploads/` 图片、视频、文件
 - `data/backups/` 备份

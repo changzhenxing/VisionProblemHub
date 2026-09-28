@@ -1,0 +1,342 @@
+<script setup>
+import { computed, onMounted, ref } from 'vue'
+import StatusPill from './components/StatusPill.vue'
+import IssueTable from './components/IssueTable.vue'
+import EventTimeline from './components/EventTimeline.vue'
+
+const nav = [
+  ['workbench', '我的工作台'], ['projects', '项目'], ['issues', '问题'],
+  ['stats', '统计趋势'], ['retro', '项目复盘'], ['knowledge', '知识库'],
+]
+const issueRetroFields = [
+  ['phenomenon', '问题现象'], ['impact', '问题影响'], ['process_summary', '处理过程'],
+  ['root_cause', '根本原因'], ['final_solution', '最终解决办法'],
+  ['validation_result', '验证结果'], ['lessons', '经验教训'], ['prevention', '预防措施'],
+]
+const projectRetroFields = [
+  ['summary', '项目结果'], ['key_problems', '重点问题'], ['delay_analysis', '延期分析'],
+  ['lessons', '经验总结'], ['improvements', '后续改进'], ['knowledge_summary', '知识沉淀'],
+]
+const knowledgeFields = [
+  ['title', '标题'], ['scene', '场景'], ['problem', '问题'], ['root_cause', '根因'],
+  ['attempts_summary', '尝试过程'], ['final_solution', '最终方案'], ['validation', '验证结果'],
+  ['lessons', '经验教训'], ['prevention', '预防措施'], ['applicability', '适用/不适用条件'], ['tags', '标签'],
+]
+
+const config = ref(null)
+const users = ref([])
+const projects = ref([])
+const userId = ref(null)
+const page = ref('workbench')
+const loading = ref(true)
+const error = ref('')
+const message = ref('')
+const modal = ref('')
+const workbench = ref(null)
+const issues = ref([])
+const stats = ref(null)
+const knowledge = ref([])
+const projectRetro = ref(null)
+const selectedRetroProject = ref('')
+const projectDetail = ref(null)
+const issueDetail = ref(null)
+const knowledgeDetail = ref(null)
+const issueTab = ref('timeline')
+const issueFilters = ref({ project_id: '', issue_type: '', priority: '', status: '', q: '', delayed_only: false })
+const knowledgeFilters = ref({ q: '', issue_type: '', confidence_state: '' })
+const statFilters = ref({ project_id: '', days: '30' })
+const userForm = ref({ name: '', role: '团队成员' })
+const projectForm = ref({ name: '', manager_id: '', current_stage: '需求确认', planned_completion_date: '', description: '' })
+const projectEdit = ref({ current_stage: '', planned_completion_date: '' })
+const issueForm = ref({ project_id: '', issue_type: '成像', description: '', priority: '重要不紧急', owner_id: '', planned_close_date: '', close_standard: '' })
+const issueCore = ref({ status: '', priority: '', owner_id: '', planned_close_date: '', close_standard: '', delay_reason: '' })
+const eventForm = ref({ event_type: '进展反馈', outcome: '', content: '' })
+const issueRetroValues = ref({})
+const projectRetroValues = ref({})
+const knowledgeValues = ref({})
+const createFiles = ref([])
+const eventFiles = ref([])
+
+const currentUser = computed(() => users.value.find((user) => user.id === userId.value) || users.value[0])
+const statsMax = computed(() => Math.max(1, ...(stats.value?.trend || []).flatMap((day) => [day.created, day.closed])))
+const evidenceCount = computed(() => (issueDetail.value?.events || []).reduce((count, event) => count + event.attachments.length, 0))
+
+async function api(url, options = {}) {
+  const response = await fetch(url, options)
+  if (!response.ok) {
+    let detail = await response.text()
+    try { detail = JSON.parse(detail).detail || detail } catch { /* use response text */ }
+    throw new Error(typeof detail === 'string' ? detail : JSON.stringify(detail))
+  }
+  return response.json()
+}
+
+function jsonOptions(method, body) {
+  return { method, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }
+}
+
+let messageTimer
+function toast(text) {
+  message.value = text
+  clearTimeout(messageTimer)
+  messageTimer = setTimeout(() => { message.value = '' }, 2500)
+}
+
+async function act(task) {
+  try { await task() } catch (cause) { toast(`操作失败：${cause.message}`) }
+}
+
+function localDateAfter(days) {
+  const date = new Date()
+  date.setDate(date.getDate() + days)
+  return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`
+}
+
+function query(values) {
+  const params = new URLSearchParams()
+  for (const [key, value] of Object.entries(values)) if (value) params.set(key, value === true ? 'true' : value)
+  return params.toString()
+}
+
+async function refreshProjects() { projects.value = await api('/api/projects') }
+
+async function navigate(target) {
+  page.value = target
+  loading.value = true
+  error.value = ''
+  try {
+    if (target === 'workbench') workbench.value = await api(`/api/workbench?owner_id=${userId.value}`)
+    if (target === 'projects') await refreshProjects()
+    if (target === 'issues') await filterIssues()
+    if (target === 'stats') await refreshStats()
+    if (target === 'retro') { await refreshProjects(); projectRetro.value = null; selectedRetroProject.value = '' }
+    if (target === 'knowledge') await filterKnowledge()
+  } catch (cause) { error.value = cause.message }
+  finally { loading.value = false }
+}
+
+async function initialize() {
+  try {
+    ;[config.value, users.value, projects.value] = await Promise.all([
+      api('/api/config'), api('/api/users'), api('/api/projects'),
+    ])
+    if (!users.value.length) {
+      await api('/api/users', jsonOptions('POST', { name: '管理员', role: '团队负责人' }))
+      users.value = await api('/api/users')
+    }
+    const saved = Number(localStorage.getItem('vision_user'))
+    userId.value = users.value.some((user) => user.id === saved) ? saved : users.value[0].id
+    await navigate('workbench')
+  } catch (cause) { error.value = `启动失败：${cause.message}`; loading.value = false }
+}
+onMounted(initialize)
+
+function changeUser() {
+  localStorage.setItem('vision_user', String(userId.value))
+  navigate(page.value)
+}
+
+function openUserCreate() { userForm.value = { name: '', role: '团队成员' }; modal.value = 'userCreate' }
+function openProjectCreate() {
+  projectForm.value = { name: '', manager_id: userId.value, current_stage: config.value.stages[0], planned_completion_date: '', description: '' }
+  modal.value = 'projectCreate'
+}
+function openIssueCreate() {
+  if (!projects.value.length) return toast('请先创建项目')
+  issueForm.value = { project_id: projects.value[0].id, issue_type: config.value.issue_types[0], description: '', priority: '重要不紧急', owner_id: userId.value, planned_close_date: localDateAfter(3), close_standard: '' }
+  createFiles.value = []
+  modal.value = 'issueCreate'
+}
+function closeModal() { modal.value = ''; projectDetail.value = null; issueDetail.value = null; knowledgeDetail.value = null }
+function setCreateFiles(event) { createFiles.value = Array.from(event.target.files || []) }
+function setEventFiles(event) { eventFiles.value = Array.from(event.target.files || []) }
+
+async function createUser() { await act(async () => {
+  await api('/api/users', jsonOptions('POST', userForm.value))
+  users.value = await api('/api/users')
+  closeModal(); toast('成员已添加')
+}) }
+
+async function createProject() { await act(async () => {
+  await api('/api/projects', jsonOptions('POST', { ...projectForm.value, manager_id: Number(projectForm.value.manager_id), description: projectForm.value.description || null }))
+  await refreshProjects()
+  closeModal(); toast('项目已创建'); await navigate('projects')
+}) }
+
+async function createIssue() { await act(async () => {
+  const payload = { ...issueForm.value, project_id: Number(issueForm.value.project_id), owner_id: Number(issueForm.value.owner_id), created_by_id: userId.value, status: '待处理', close_standard: issueForm.value.close_standard || null }
+  const created = await api('/api/issues', jsonOptions('POST', payload))
+  if (createFiles.value.length) {
+    const data = new FormData()
+    data.append('actor_id', String(userId.value))
+    data.append('attachment_role', '问题证据')
+    createFiles.value.forEach((file) => data.append('files', file))
+    await api(`/api/issues/${created.id}/creation-attachments`, { method: 'POST', body: data })
+  }
+  await refreshProjects()
+  closeModal(); toast('问题已记录'); await navigate(page.value)
+}) }
+
+async function openProject(id) { await act(async () => {
+  projectDetail.value = await api(`/api/projects/${id}`)
+  projectEdit.value = { current_stage: projectDetail.value.current_stage, planned_completion_date: projectDetail.value.planned_completion_date }
+  modal.value = 'project'
+}) }
+
+async function saveProject() { await act(async () => {
+  await api(`/api/projects/${projectDetail.value.id}`, jsonOptions('PATCH', { actor_id: userId.value, ...projectEdit.value }))
+  closeModal(); toast('项目已更新'); await navigate('projects')
+}) }
+
+async function filterIssues() { issues.value = await api(`/api/issues?${query(issueFilters.value)}`) }
+async function refreshStats() { stats.value = await api(`/api/stats?${query(statFilters.value)}`) }
+async function filterKnowledge() { knowledge.value = await api(`/api/knowledge?${query(knowledgeFilters.value)}`) }
+
+async function loadProjectRetro() { await act(async () => {
+  if (!selectedRetroProject.value) { projectRetro.value = null; return }
+  projectRetro.value = await api(`/api/projects/${selectedRetroProject.value}/retrospective`)
+  projectRetroValues.value = Object.fromEntries(projectRetroFields.map(([key]) => [key, projectRetro.value.retrospective[key] || '']))
+}) }
+
+async function saveProjectRetro() { await act(async () => {
+  await api(`/api/projects/${selectedRetroProject.value}/retrospective`, jsonOptions('PATCH', { actor_id: userId.value, values: projectRetroValues.value, confirm: true }))
+  toast('项目复盘已保存'); await loadProjectRetro()
+}) }
+
+async function regenerateProjectRetro() { await act(async () => {
+  await api(`/api/projects/${selectedRetroProject.value}/retrospective/regenerate`, { method: 'POST' })
+  toast('已按最新问题自动更新'); await loadProjectRetro()
+}) }
+
+async function openIssue(id, tab = 'timeline') { await act(async () => {
+  issueDetail.value = await api(`/api/issues/${id}`)
+  issueTab.value = tab
+  issueCore.value = {
+    status: issueDetail.value.status, priority: issueDetail.value.priority, owner_id: issueDetail.value.owner_id,
+    planned_close_date: issueDetail.value.planned_close_date, close_standard: issueDetail.value.close_standard || '',
+    delay_reason: issueDetail.value.delay_reason || '',
+  }
+  eventForm.value = { event_type: '进展反馈', outcome: '', content: '' }
+  eventFiles.value = []
+  issueRetroValues.value = Object.fromEntries(issueRetroFields.map(([key]) => [key, issueDetail.value.retrospective[key] || '']))
+  modal.value = 'issue'
+}) }
+
+async function addEvent() { await act(async () => {
+  const data = new FormData()
+  data.append('actor_id', String(userId.value))
+  data.append('event_type', eventForm.value.event_type)
+  data.append('content', eventForm.value.content)
+  if (eventForm.value.outcome) data.append('outcome', eventForm.value.outcome)
+  const roles = { '进展反馈': '问题证据', '解决办法': '方案说明', '验证结果': '验证证据', '根因判断': '问题证据' }
+  data.append('attachment_role', roles[eventForm.value.event_type] || '其他')
+  eventFiles.value.forEach((file) => data.append('files', file))
+  const id = issueDetail.value.id
+  await api(`/api/issues/${id}/events`, { method: 'POST', body: data })
+  toast('进展已记录并自动进入复盘'); await openIssue(id)
+}) }
+
+async function saveIssueCore() { await act(async () => {
+  const id = issueDetail.value.id
+  const updated = await api(`/api/issues/${id}`, jsonOptions('PATCH', {
+    actor_id: userId.value, ...issueCore.value, owner_id: Number(issueCore.value.owner_id),
+    close_standard: issueCore.value.close_standard || null, delay_reason: issueCore.value.delay_reason || null,
+  }))
+  toast(updated.meaningful_changes ? `已记录${updated.meaningful_changes}项有效变更` : '没有有效变化，不产生历史噪声')
+  await openIssue(id)
+}) }
+
+async function saveIssueRetro() { await act(async () => {
+  const id = issueDetail.value.id
+  await api(`/api/issues/${id}/retrospective`, jsonOptions('PATCH', { actor_id: userId.value, values: issueRetroValues.value, confirm: true }))
+  toast('复盘已确认，人工修订已留痕'); await openIssue(id, 'retro')
+}) }
+
+async function regenerateIssueRetro() { await act(async () => {
+  const id = issueDetail.value.id
+  await api(`/api/issues/${id}/retrospective/regenerate`, { method: 'POST' })
+  toast('已重新提取，人工锁定字段保留'); await openIssue(id, 'retro')
+}) }
+
+async function openKnowledge(id) { await act(async () => {
+  knowledgeDetail.value = await api(`/api/knowledge/${id}`)
+  knowledgeValues.value = Object.fromEntries(knowledgeFields.map(([key]) => [key, knowledgeDetail.value[key] || '']))
+  knowledgeValues.value.confidence_state = knowledgeDetail.value.confidence_state
+  modal.value = 'knowledge'
+}) }
+
+async function saveKnowledge() { await act(async () => {
+  await api(`/api/knowledge/${knowledgeDetail.value.id}`, jsonOptions('PATCH', { actor_id: userId.value, values: knowledgeValues.value }))
+  closeModal(); toast('知识案例已保存'); await navigate('knowledge')
+}) }
+
+function barMax(items) { return Math.max(1, ...items.map((item) => item.count)) }
+function date(value) { return value ? String(value).slice(0, 10) : '' }
+function downloadAgentExport() { window.open('/api/knowledge/export/agent', '_blank', 'noopener') }
+</script>
+
+<template>
+  <header>
+    <div class="brand"><div class="logo">V</div><div><b>工业视觉项目与知识平台</b><small>问题驱动 · 过程留痕 · 自动复盘 · 经验沉淀</small></div></div>
+    <nav><button v-for="[key, label] in nav" :key="key" :class="{ active: page === key }" @click="navigate(key)">{{ label }}</button></nav>
+    <div class="userbox" v-if="currentUser"><span>当前用户</span><select v-model.number="userId" aria-label="当前用户" @change="changeUser"><option v-for="user in users" :key="user.id" :value="user.id">{{ user.name }}</option></select><button class="primary" @click="openIssueCreate">＋ 新增问题</button></div>
+  </header>
+
+  <main>
+    <div v-if="loading" class="loading">加载中…</div>
+    <div v-else-if="error" class="empty">{{ error }}</div>
+
+    <template v-else-if="page === 'workbench' && workbench">
+      <div class="page-head"><div><h1>{{ currentUser?.name }}的工作台</h1><p>只看需要你处理的事，项目管理和复盘由系统自动生成。</p></div><div class="toolbar"><button class="secondary" @click="openUserCreate">＋ 成员</button><button class="secondary" @click="openProjectCreate">＋ 项目</button></div></div>
+      <div class="cards"><div v-for="[label, count] in [['我的未关闭', workbench.counts.all], ['紧急重要', workbench.counts.critical], ['阻塞', workbench.counts.blocked], ['本周到期', workbench.counts.due_week], ['已延期', workbench.counts.delayed]]" :key="label" class="card metric"><span>{{ label }}</span><b>{{ count }}</b></div></div>
+      <div class="panel"><div class="panel-head"><h2>我的问题</h2><span class="muted">优先显示紧急 / 阻塞 / 临期</span></div><IssueTable :issues="workbench.issues" @open="openIssue" /></div>
+    </template>
+
+    <template v-else-if="page === 'projects'">
+      <div class="page-head"><div><h1>项目总览</h1><p>项目状态由未关闭问题自动推导，减少重复维护。</p></div><button class="primary" @click="openProjectCreate">＋ 新建项目</button></div>
+      <div class="panel table-wrap"><table><thead><tr><th>项目</th><th>负责人</th><th>阶段</th><th>总体状态</th><th>计划完成</th><th>未关闭</th><th>紧急重要</th><th>阻塞</th><th>延期</th></tr></thead><tbody>
+        <tr v-for="project in projects" :key="project.id" class="clickable" @click="openProject(project.id)"><td><b>{{ project.name }}</b></td><td>{{ project.manager_name }}</td><td><StatusPill :value="project.current_stage" /></td><td><StatusPill :value="project.overall_status" /></td><td>{{ date(project.planned_completion_date) }}</td><td>{{ project.counts.open }}</td><td>{{ project.counts.critical }}</td><td>{{ project.counts.blocked }}</td><td>{{ project.counts.delayed }}</td></tr>
+        <tr v-if="!projects.length"><td colspan="9" class="empty">暂无项目</td></tr>
+      </tbody></table></div>
+    </template>
+
+    <template v-else-if="page === 'issues'">
+      <div class="page-head"><div><h1>全部问题</h1><p>所有任务、风险和现场异常统一为“问题”，一行一个待解决事项。</p></div></div>
+      <form class="toolbar filters" @submit.prevent="act(filterIssues)"><select v-model="issueFilters.project_id" aria-label="筛选项目"><option value="">全部项目</option><option v-for="project in projects" :key="project.id" :value="project.id">{{ project.name }}</option></select><select v-model="issueFilters.issue_type" aria-label="筛选类型"><option value="">全部类型</option><option v-for="item in config.issue_types" :key="item">{{ item }}</option></select><select v-model="issueFilters.priority" aria-label="筛选优先级"><option value="">全部优先级</option><option v-for="item in config.priorities" :key="item">{{ item }}</option></select><select v-model="issueFilters.status" aria-label="筛选状态"><option value="">全部状态</option><option v-for="item in config.issue_statuses" :key="item">{{ item }}</option></select><input v-model="issueFilters.q" placeholder="搜索问题" /><label><input v-model="issueFilters.delayed_only" type="checkbox" /> 仅延期</label><button class="secondary">筛选</button></form>
+      <div class="panel"><IssueTable :issues="issues" @open="openIssue" /></div>
+    </template>
+
+    <template v-else-if="page === 'stats' && stats">
+      <div class="page-head"><div><h1>统计趋势</h1><p>观察问题新增/关闭速度、延期率和问题结构。</p></div><div class="toolbar"><select v-model="statFilters.project_id" aria-label="统计项目" @change="act(refreshStats)"><option value="">全部项目</option><option v-for="project in projects" :key="project.id" :value="project.id">{{ project.name }}</option></select><select v-model="statFilters.days" aria-label="统计天数" @change="act(refreshStats)"><option value="7">7天</option><option value="30">30天</option><option value="90">90天</option></select></div></div>
+      <div class="cards"><div v-for="[label, count] in [['问题总数', stats.summary.total], ['未关闭', stats.summary.open], ['紧急重要', stats.summary.critical], ['阻塞', stats.summary.blocked], ['延期率', `${stats.summary.delay_rate}%`]]" :key="label" class="card metric"><span>{{ label }}</span><b>{{ count }}</b></div></div>
+      <div class="grid2"><div class="panel"><div class="panel-head"><h2>新增 / 关闭趋势</h2><span><i style="color:#5472f2">■</i>新增　<i style="color:#41a36f">■</i>关闭</span></div><div class="trend"><div v-for="day in stats.trend" :key="day.date" class="day" :title="`${day.date} 新增${day.created} 关闭${day.closed}`"><i class="c" :style="{ height: `${Math.max(2, day.created / statsMax * 100)}%` }"></i><i class="x" :style="{ height: `${Math.max(2, day.closed / statsMax * 100)}%` }"></i></div></div></div><div class="panel"><div class="panel-head"><h2>问题类型分布</h2></div><div class="bars"><div v-for="item in stats.types" :key="item.name" class="bar-row"><span>{{ item.name }}</span><div class="bar-bg"><div class="bar-fill" :style="{ width: `${item.count / barMax(stats.types) * 100}%` }"></div></div><b>{{ item.count }}</b></div><div v-if="!stats.types.length" class="empty">暂无数据</div></div></div></div>
+      <div class="panel"><div class="panel-head"><h2>主要延期原因</h2></div><div class="bars"><div v-for="item in stats.delay_reasons" :key="item.name" class="bar-row"><span>{{ item.name }}</span><div class="bar-bg"><div class="bar-fill" :style="{ width: `${item.count / barMax(stats.delay_reasons) * 100}%` }"></div></div><b>{{ item.count }}</b></div><div v-if="!stats.delay_reasons.length" class="empty">暂无数据</div></div></div>
+    </template>
+
+    <template v-else-if="page === 'retro'">
+      <div class="page-head"><div><h1>项目复盘</h1><p>问题复盘在处理过程中自动积累，项目复盘直接汇总。</p></div><select v-model="selectedRetroProject" aria-label="选择复盘项目" @change="loadProjectRetro"><option value="">选择项目</option><option v-for="project in projects" :key="project.id" :value="project.id">{{ project.name }}</option></select></div>
+      <div v-if="!projectRetro" class="empty">请选择一个项目</div>
+      <template v-else><div class="cards"><div v-for="[label, count] in [['未关闭', projectRetro.project.counts.open], ['紧急重要', projectRetro.project.counts.critical], ['阻塞', projectRetro.project.counts.blocked], ['延期', projectRetro.project.counts.delayed], ['阶段', projectRetro.project.current_stage]]" :key="label" class="card metric"><span>{{ label }}</span><b>{{ count }}</b></div></div><div class="panel"><div class="panel-head"><h2>自动生成 + 人工修订</h2><div class="toolbar"><button class="secondary" @click="regenerateProjectRetro">重新自动提取</button><button class="primary" @click="saveProjectRetro">保存并确认</button></div></div><div class="retro-fields"><div v-for="[key, label] in projectRetroFields" :key="key" class="retro-field"><label>{{ label }}<span :class="{ locked: projectRetro.retrospective.locked_fields.includes(key) }">{{ projectRetro.retrospective.locked_fields.includes(key) ? '人工内容已锁定' : '自动提取' }}</span></label><textarea v-model="projectRetroValues[key]" :aria-label="label"></textarea></div></div></div></template>
+    </template>
+
+    <template v-else-if="page === 'knowledge'">
+      <div class="page-head"><div><h1>工业视觉知识库</h1><p>从真实问题处理过程自动形成可复用的案例。</p></div><button class="secondary" @click="downloadAgentExport">Agent结构化导出</button></div>
+      <form class="toolbar filters" @submit.prevent="act(filterKnowledge)"><input v-model="knowledgeFilters.q" placeholder="搜索问题/根因/方案/标签" /><select v-model="knowledgeFilters.issue_type" aria-label="知识类型"><option value="">全部类型</option><option v-for="item in config.issue_types" :key="item">{{ item }}</option></select><select v-model="knowledgeFilters.confidence_state" aria-label="知识可信度"><option value="">全部可信度</option><option v-for="item in config.knowledge_states" :key="item">{{ item }}</option></select><button class="secondary">搜索</button></form>
+      <div class="panel"><div v-for="item in knowledge" :key="item.id" class="knowledge-card" @click="openKnowledge(item.id)"><h3>{{ item.title }} <StatusPill :value="item.confidence_state" /></h3><p><b>根因：</b>{{ (item.root_cause || '').slice(0, 180) }}</p><p><b>最终方案：</b>{{ (item.final_solution || '').slice(0, 180) }}</p><p class="muted">{{ item.project_name }} · 证据{{ item.evidence_count }}份 · {{ item.tags }}</p></div><div v-if="!knowledge.length" class="empty">知识案例会随着问题处理自动产生</div></div>
+    </template>
+  </main>
+
+  <div v-if="modal" class="modal" @click.self="closeModal"><div class="modal-card"><button class="close" aria-label="关闭" @click="closeModal">×</button>
+    <template v-if="modal === 'userCreate'"><h2>添加成员</h2><form class="form" @submit.prevent="createUser"><label>姓名<input v-model="userForm.name" required /></label><label>角色<input v-model="userForm.role" /></label><button class="primary">添加</button></form></template>
+    <template v-else-if="modal === 'projectCreate'"><h2>新建项目</h2><form class="form" @submit.prevent="createProject"><label>项目名称<input v-model="projectForm.name" required /></label><div class="form-row"><label>项目负责人<select v-model="projectForm.manager_id"><option v-for="user in users" :key="user.id" :value="user.id">{{ user.name }}</option></select></label><label>当前阶段<select v-model="projectForm.current_stage"><option v-for="item in config.stages" :key="item">{{ item }}</option></select></label></div><label>总体计划完成时间<input v-model="projectForm.planned_completion_date" type="date" required /></label><label>项目说明<textarea v-model="projectForm.description"></textarea></label><button class="primary">创建</button></form></template>
+    <template v-else-if="modal === 'issueCreate'"><h2>快速新增问题</h2><p class="muted">只填写必要信息；图片/视频可直接一起上传。</p><form class="form" @submit.prevent="createIssue"><div class="form-row"><label>项目<select v-model="issueForm.project_id"><option v-for="project in projects" :key="project.id" :value="project.id">{{ project.name }}</option></select></label><label>问题类型<select v-model="issueForm.issue_type"><option v-for="item in config.issue_types" :key="item">{{ item }}</option></select></label></div><label>问题描述<textarea v-model="issueForm.description" required placeholder="把现场真正需要解决的事写清楚…"></textarea></label><div class="form-row"><label>优先级<select v-model="issueForm.priority"><option v-for="item in config.priorities" :key="item">{{ item }}</option></select></label><label>问题Owner<select v-model="issueForm.owner_id"><option v-for="user in users" :key="user.id" :value="user.id">{{ user.name }}</option></select></label></div><div class="form-row"><label>计划关闭时间<input v-model="issueForm.planned_close_date" type="date" required /></label><label>关闭标准（可后补）<input v-model="issueForm.close_standard" placeholder="怎样证明问题真的解决" /></label></div><label>问题证据（可选）<input type="file" multiple accept="image/*,video/*,.log,.txt,.csv,.xlsx,.zip" @change="setCreateFiles" /></label><button class="primary">保存问题</button></form></template>
+    <template v-else-if="modal === 'project' && projectDetail"><h2>{{ projectDetail.name }}</h2><div class="cards"><div v-for="[label, count] in [['状态', projectDetail.overall_status], ['阶段', projectDetail.current_stage], ['未关闭', projectDetail.counts.open], ['阻塞', projectDetail.counts.blocked], ['延期', projectDetail.counts.delayed]]" :key="label" class="card metric"><span>{{ label }}</span><b>{{ count }}</b></div></div><div class="form-row project-edit"><label>当前阶段<select v-model="projectEdit.current_stage"><option v-for="item in config.stages" :key="item">{{ item }}</option></select></label><label>计划完成时间<input v-model="projectEdit.planned_completion_date" type="date" /></label></div><button class="secondary" @click="saveProject">保存项目状态</button><h3>问题</h3><div class="table-wrap"><table><thead><tr><th>类型</th><th>问题</th><th>优先级</th><th>状态</th><th>Owner</th><th>关闭时间</th></tr></thead><tbody><tr v-for="issue in projectDetail.issues" :key="issue.id" class="clickable" @click="openIssue(issue.id)"><td><StatusPill :value="issue.issue_type" /></td><td>{{ issue.description }}</td><td><StatusPill :value="issue.priority" /></td><td><StatusPill :value="issue.status" /></td><td>{{ issue.owner_name }}</td><td>{{ date(issue.planned_close_date) }}</td></tr><tr v-if="!projectDetail.issues.length"><td colspan="6" class="empty">暂无问题</td></tr></tbody></table></div></template>
+    <template v-else-if="modal === 'issue' && issueDetail"><h2>{{ issueDetail.description }}</h2><p class="muted">{{ issueDetail.project_name }} · <StatusPill :value="issueDetail.issue_type" /> <StatusPill :value="issueDetail.priority" /> <StatusPill :value="issueDetail.status" /> <StatusPill v-if="issueDetail.is_delayed" :value="`延期${issueDetail.delay_days}天`" /></p><div class="tabs"><button v-for="[key, label] in [['timeline', '处理时间线'], ['retro', '问题复盘'], ['knowledge', '知识案例']]" :key="key" :class="{ active: issueTab === key }" @click="issueTab = key">{{ label }}</button></div>
+      <div v-if="issueTab === 'timeline'" class="grid2"><div><div class="quick-event"><b>随手反馈</b><div class="form-row"><select v-model="eventForm.event_type" aria-label="反馈类型"><option v-for="item in config.event_types" :key="item">{{ item }}</option></select><select v-model="eventForm.outcome" aria-label="反馈结果"><option value="">结果（可选）</option><option v-for="item in config.event_outcomes" :key="item">{{ item }}</option></select></div><textarea v-model="eventForm.content" placeholder="进展、尝试、判断、验证结果…"></textarea><input type="file" multiple accept="image/*,video/*,.log,.txt,.csv,.xlsx,.zip" @change="setEventFiles" /><p class="file-hint">附件角色会按反馈类型自动归类。</p><button class="primary" @click="addEvent">提交反馈</button></div><EventTimeline :events="issueDetail.events" /></div><div><div class="panel"><div class="panel-head"><h2>问题属性</h2></div><div class="form issue-core"><label>状态<select v-model="issueCore.status"><option v-for="item in config.issue_statuses" :key="item">{{ item }}</option></select></label><label>优先级<select v-model="issueCore.priority"><option v-for="item in config.priorities" :key="item">{{ item }}</option></select></label><label>问题Owner<select v-model="issueCore.owner_id"><option v-for="user in users" :key="user.id" :value="user.id">{{ user.name }}</option></select></label><label>计划关闭<input v-model="issueCore.planned_close_date" type="date" /></label><label>关闭标准<textarea v-model="issueCore.close_standard"></textarea></label><label>延期原因<textarea v-model="issueCore.delay_reason"></textarea></label><button class="secondary" @click="saveIssueCore">保存有意义变更</button></div></div><div class="card"><b>系统自动沉淀</b><p class="muted">当前已有 {{ issueDetail.events.length }} 条事件记录、{{ evidenceCount }} 份多模态证据。</p></div></div></div>
+      <div v-else-if="issueTab === 'retro'" class="panel"><div class="panel-head"><h2>伴随式问题复盘</h2><div class="toolbar"><button class="secondary" @click="regenerateIssueRetro">重新自动提取</button><button class="primary" @click="saveIssueRetro">保存并确认</button></div></div><div class="retro-fields"><div v-for="[key, label] in issueRetroFields" :key="key" class="retro-field"><label>{{ label }}<span :class="{ locked: issueDetail.retrospective.locked_fields.includes(key) }">{{ issueDetail.retrospective.locked_fields.includes(key) ? '人工内容已锁定' : '自动提取' }}</span></label><textarea v-model="issueRetroValues[key]" :aria-label="label"></textarea></div></div></div>
+      <div v-else class="card knowledge-detail"><h3>{{ issueDetail.knowledge.title }} <StatusPill :value="issueDetail.knowledge.confidence_state" /></h3><p v-for="[key, label] in knowledgeFields.filter(([key]) => key !== 'title' && key !== 'tags')" :key="key"><b>{{ label }}：</b>{{ issueDetail.knowledge[key] }}</p><p class="muted">证据 {{ issueDetail.knowledge.evidence_count }} 份 · 标签 {{ issueDetail.knowledge.tags }}</p><button class="secondary" @click="openKnowledge(issueDetail.knowledge.id)">编辑知识案例</button></div>
+    </template>
+    <template v-else-if="modal === 'knowledge' && knowledgeDetail"><h2>知识案例</h2><p><StatusPill :value="knowledgeDetail.confidence_state" /> · 证据{{ knowledgeDetail.evidence_count }}份</p><div class="form"><label v-for="[key, label] in knowledgeFields" :key="key">{{ label }}<span v-if="knowledgeDetail.locked_fields.includes(key)" class="locked">人工锁定</span><textarea v-model="knowledgeValues[key]"></textarea></label><label>可信度<select v-model="knowledgeValues.confidence_state"><option v-for="item in config.knowledge_states" :key="item">{{ item }}</option></select></label><button class="primary" @click="saveKnowledge">保存人工修订</button></div><h3>原始处理证据</h3><EventTimeline :events="knowledgeDetail.events" /></template>
+  </div></div>
+  <div id="toast" :class="{ show: message }" role="status">{{ message }}</div>
+</template>
