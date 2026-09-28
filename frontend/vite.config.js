@@ -1,6 +1,8 @@
 import { defineConfig } from 'vite'
 import vue from '@vitejs/plugin-vue'
 
+const backend = `http://127.0.0.1:${process.env.VISION_PORT || '8765'}`
+
 export default defineConfig(({ command }) => ({
   plugins: [vue()],
   base: command === 'build' ? '/static/' : '/',
@@ -10,8 +12,8 @@ export default defineConfig(({ command }) => ({
   },
   server: {
     proxy: {
-      '/api': 'http://127.0.0.1:8000',
-      '/uploads': 'http://127.0.0.1:8000',
+      '/api': backend,
+      '/uploads': backend,
     },
   },
 }))
