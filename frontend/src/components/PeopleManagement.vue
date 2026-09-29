@@ -47,4 +47,4 @@ async function saveReport(confirm) { try { report.value = await send('/api/repor
     <section v-else-if="active==='report' && report" class="panel"><h2>{{ report.week_start }} 周报</h2><p class="muted">{{ report.source }} · {{ report.confirmed_at ? '已确认' : '待确认' }}</p><textarea v-model="report.content" class="people-report" /><div class="toolbar"><button class="secondary" @click="saveReport(false)">保存草稿</button><button v-if="can('reports.write')" class="primary" @click="saveReport(true)">确认周报</button></div></section>
   </div>
 </template>
-<style scoped>.panel{padding:16px}.people-error{color:#ad3131}.people-item{padding:12px 0;border-bottom:1px solid #e5e9f2}.people-item p{white-space:pre-wrap}.people-link{border:0;background:none;color:#4266cc;cursor:pointer}.people-report{width:100%;min-height:400px;box-sizing:border-box}</style>
+<style scoped>.panel{padding:16px}.people-error{color:#ad3131}.people-item{padding:12px 0;border-bottom:1px solid var(--line)}.people-item p{white-space:pre-wrap}.people-link{border:0;background:none;color:var(--blue);cursor:pointer}.people-report{width:100%;min-height:400px;box-sizing:border-box}</style>

@@ -77,5 +77,5 @@ async function removeCollaborator(id) {
 </template>
 
 <style scoped>
-.communication{display:grid;gap:16px}.panel{padding:16px}.comm-item{padding:12px 0;border-bottom:1px solid #e4e9f2}.comm-item p{white-space:pre-wrap;margin:5px 0}.comm-chip{display:inline-flex;gap:5px;margin:4px;padding:5px 9px;background:#eef3fc;border-radius:15px}.comm-chip button,.link-button{border:0;background:none;cursor:pointer;color:#4266cc}.error{color:#ad3131}
+.communication{display:grid;gap:16px}.panel{padding:16px}.comm-item{padding:12px 0;border-bottom:1px solid var(--line)}.comm-item p{white-space:pre-wrap;margin:5px 0}.comm-chip{display:inline-flex;gap:5px;margin:4px;padding:5px 9px;background:#eef2ff;border-radius:15px}.comm-chip button,.link-button{border:0;background:none;cursor:pointer;color:var(--blue)}.error{color:#ad3131}
 </style>
