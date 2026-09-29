@@ -18,6 +18,7 @@ def test_existing_users_are_migrated_without_data_loss(tmp_path):
 
     with sqlite3.connect(database) as db:
         assert db.execute("SELECT COUNT(*) FROM users").fetchone()[0] == 2
-        assert db.execute("SELECT COUNT(*) FROM roles").fetchone()[0] == 4
+        assert db.execute("SELECT COUNT(*) FROM roles").fetchone()[0] == 9
+        assert db.execute("SELECT COUNT(*) FROM user_roles").fetchone()[0] == 2
         rows = db.execute("SELECT users.name, roles.name, users.password_hash FROM users JOIN roles ON roles.id=users.role_id ORDER BY users.id").fetchall()
         assert rows == [("管理员", "管理员", None), ("工程师甲", "团队成员", None)]

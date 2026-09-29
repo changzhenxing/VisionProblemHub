@@ -13,6 +13,7 @@ class User(Base):
     role_id: Mapped[Optional[int]] = mapped_column(ForeignKey("roles.id"), nullable=True)
     password_hash: Mapped[Optional[str]] = mapped_column(String(256), nullable=True)
     active: Mapped[bool] = mapped_column(Boolean, default=True)
+    team_id: Mapped[Optional[int]] = mapped_column(ForeignKey("teams.id"), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
     assigned_role: Mapped[Optional[Role]] = relationship(foreign_keys=[role_id])
 
@@ -29,6 +30,140 @@ class LoginSession(Base):
     token_hash: Mapped[str] = mapped_column(String(64), primary_key=True)
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
     expires_at: Mapped[datetime] = mapped_column(DateTime, index=True)
+
+class Department(Base):
+    __tablename__ = "departments"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    name: Mapped[str] = mapped_column(String(100), unique=True)
+
+class Team(Base):
+    __tablename__ = "teams"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    department_id: Mapped[int] = mapped_column(ForeignKey("departments.id"), index=True)
+    name: Mapped[str] = mapped_column(String(100))
+
+class UserRole(Base):
+    __tablename__ = "user_roles"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    role_id: Mapped[int] = mapped_column(ForeignKey("roles.id"), index=True)
+    scope: Mapped[str] = mapped_column(String(20), default="self")
+    scope_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+
+class ProjectMember(Base):
+    __tablename__ = "project_members"
+    project_id: Mapped[int] = mapped_column(ForeignKey("projects.id"), primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), primary_key=True)
+    member_role: Mapped[str] = mapped_column(String(30), default="成员")
+
+class Milestone(Base):
+    __tablename__ = "milestones"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    project_id: Mapped[int] = mapped_column(ForeignKey("projects.id"), index=True)
+    title: Mapped[str] = mapped_column(String(160))
+    due_date: Mapped[date] = mapped_column(Date)
+    completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+
+class IssueCollaborator(Base):
+    __tablename__ = "issue_collaborators"
+    issue_id: Mapped[int] = mapped_column(ForeignKey("issues.id"), primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), primary_key=True)
+
+class Feedback(Base):
+    __tablename__ = "feedback"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    issue_id: Mapped[int] = mapped_column(ForeignKey("issues.id"), index=True)
+    event_id: Mapped[Optional[int]] = mapped_column(ForeignKey("issue_events.id"), nullable=True)
+    author_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    recipient_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    kind: Mapped[str] = mapped_column(String(20))
+    content: Mapped[str] = mapped_column(Text)
+    visibility: Mapped[str] = mapped_column(String(30), default="project")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now, index=True)
+
+class FeedbackAttachment(Base):
+    __tablename__ = "feedback_attachments"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    feedback_id: Mapped[int] = mapped_column(ForeignKey("feedback.id"), index=True)
+    original_name: Mapped[str] = mapped_column(String(255))
+    stored_name: Mapped[str] = mapped_column(String(255), unique=True)
+    mime_type: Mapped[str] = mapped_column(String(120))
+    size_bytes: Mapped[int] = mapped_column(Integer)
+
+class Decision(Base):
+    __tablename__ = "decisions"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    issue_id: Mapped[int] = mapped_column(ForeignKey("issues.id"), index=True)
+    author_id: Mapped[int] = mapped_column(ForeignKey("users.id"))
+    fact: Mapped[str] = mapped_column(Text, default="")
+    judgment: Mapped[str] = mapped_column(Text, default="")
+    decision: Mapped[str] = mapped_column(Text, default="")
+    commitment: Mapped[str] = mapped_column(Text, default="")
+    owner_id: Mapped[Optional[int]] = mapped_column(ForeignKey("users.id"), nullable=True)
+    due_date: Mapped[Optional[date]] = mapped_column(Date, nullable=True)
+    visibility: Mapped[str] = mapped_column(String(30), default="project")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
+
+class OneOnOne(Base):
+    __tablename__ = "one_on_ones"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    subject_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    manager_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    summary: Mapped[str] = mapped_column(Text, default="")
+    actions: Mapped[str] = mapped_column(Text, default="")
+    resource_request: Mapped[str] = mapped_column(Text, default="")
+    growth_goal: Mapped[str] = mapped_column(Text, default="")
+    confirmed_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
+
+class SkillEvidence(Base):
+    __tablename__ = "skill_evidence"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    issue_id: Mapped[int] = mapped_column(ForeignKey("issues.id"), index=True)
+    event_id: Mapped[Optional[int]] = mapped_column(ForeignKey("issue_events.id"), nullable=True)
+    skill: Mapped[str] = mapped_column(String(80))
+    evidence: Mapped[str] = mapped_column(Text)
+    state: Mapped[str] = mapped_column(String(20), default="待确认")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
+
+class GrowthAction(Base):
+    __tablename__ = "growth_actions"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    subject_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    one_on_one_id: Mapped[Optional[int]] = mapped_column(ForeignKey("one_on_ones.id"), nullable=True)
+    title: Mapped[str] = mapped_column(String(200))
+    due_date: Mapped[Optional[date]] = mapped_column(Date, nullable=True)
+    status: Mapped[str] = mapped_column(String(20), default="进行中")
+
+class Notification(Base):
+    __tablename__ = "notifications"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    kind: Mapped[str] = mapped_column(String(30))
+    content: Mapped[str] = mapped_column(String(400))
+    issue_id: Mapped[Optional[int]] = mapped_column(ForeignKey("issues.id"), nullable=True)
+    read_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
+
+class AuditLog(Base):
+    __tablename__ = "audit_logs"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    actor_id: Mapped[Optional[int]] = mapped_column(ForeignKey("users.id"), nullable=True)
+    action: Mapped[str] = mapped_column(String(80))
+    resource_type: Mapped[str] = mapped_column(String(40))
+    resource_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    before_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    after_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
+
+class WeeklyReport(Base):
+    __tablename__ = "weekly_reports"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    week_start: Mapped[date] = mapped_column(Date)
+    content: Mapped[str] = mapped_column(Text)
+    confirmed_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
 
 class Project(Base):
     __tablename__ = "projects"

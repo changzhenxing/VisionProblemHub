@@ -190,3 +190,72 @@ def test_login_and_role_permissions():
     assert reset_client.post('/api/auth/password',json={'current_password':'NewPassword123!','new_password':'LastPassword123!'}).status_code==200
     assert reset_client.get('/api/projects').status_code==200
     assert second_session.get('/api/projects').status_code==401
+
+
+def test_management_feedback_people_and_scope():
+    roles = client.get('/api/admin/roles').json()
+    member = next(role for role in roles if role['name'] == '团队成员')
+    supervisor = next(role for role in roles if role['name'] == '团队主管')
+    dept = client.post('/api/org/departments', json={'name': '视觉研发'}).json()
+    team = client.post('/api/org/teams', json={'name': '成像组', 'department_id': dept['id']}).json()
+    boss = client.post('/api/users', json={'name': '测试主管', 'role_id': supervisor['id'],
+                    'team_id': team['id'], 'scope': 'team', 'password': 'SupervisorPassword123!'}).json()
+    worker = client.post('/api/users', json={'name': '测试工程师', 'role_id': member['id'],
+                      'team_id': team['id'], 'password': 'EngineerPassword123!'}).json()
+    outsider = client.post('/api/users', json={'name': '外部测试员', 'role_id': member['id'],
+                        'password': 'OutsidePassword123!'}).json()
+    project = client.post('/api/projects', json={'name': '权限验收项目', 'manager_id': boss['id'],
+                         'current_stage': '开发验证', 'planned_completion_date': str(date.today()+timedelta(days=20))}).json()
+    iid = client.post('/api/issues', json={'project_id': project['id'], 'issue_type': '成像',
+         'description': '测试条纹反光及低对比度', 'priority': '紧急重要', 'status': '待处理',
+         'owner_id': worker['id'], 'planned_close_date': str(date.today()+timedelta(days=3)),
+         'created_by_id': boss['id']}).json()['id']
+    manager_session = TestClient(app)
+    worker_session = TestClient(app)
+    outsider_session = TestClient(app)
+    assert manager_session.post('/api/auth/login', json={'name': '测试主管', 'password': 'SupervisorPassword123!'}).status_code == 200
+    assert worker_session.post('/api/auth/login', json={'name': '测试工程师', 'password': 'EngineerPassword123!'}).status_code == 200
+    assert outsider_session.post('/api/auth/login', json={'name': '外部测试员', 'password': 'OutsidePassword123!'}).status_code == 200
+    assert outsider_session.get(f'/api/issues/{iid}').status_code == 404
+    assert all(item['id'] != iid for item in outsider_session.get('/api/issues').json())
+    new_issue = {'project_id': project['id'], 'issue_type': '成像', 'description': '同项目新的反光验证',
+                 'priority': '一般', 'status': '待处理', 'owner_id': worker['id'],
+                 'planned_close_date': str(date.today()+timedelta(days=5)), 'created_by_id': worker['id']}
+    assert outsider_session.post('/api/issues', json=new_issue).status_code == 403
+    assert worker_session.post('/api/issues', json=new_issue).status_code == 200
+    viewer = next(role for role in roles if role['name'] == '只读成员')
+    assert client.put(f'/api/admin/users/{outsider["id"]}/roles', json=[
+        {'role_id': member['id'], 'scope': 'self', 'scope_id': None},
+        {'role_id': viewer['id'], 'scope': 'project', 'scope_id': project['id']},
+    ]).status_code == 200
+    assert outsider_session.get(f'/api/issues/{iid}').status_code == 200
+    assert outsider_session.post('/api/issues', json=new_issue).status_code == 403
+    assert client.put('/api/admin/users/1/roles', json=[
+        {'role_id': viewer['id'], 'scope': 'all', 'scope_id': None}]).status_code == 400
+    assert outsider_session.get('/api/people').json() == [next(item for item in outsider_session.get('/api/people').json() if item['id'] == outsider['id'])]
+    assert manager_session.get(f'/api/issues/{iid}').status_code == 200
+    assert manager_session.post(f'/api/projects/{project["id"]}/milestones', json={
+        'title': '三批次验证', 'due_date': str(date.today()+timedelta(days=7))}).status_code == 200
+    note = manager_session.post(f'/api/people/{worker["id"]}/one-on-ones', json={
+        'summary': '确认成像资源', 'growth_goal': '独立负责下一阶段成像方案'}).json()
+    assert note['confirmed_at'] is None
+    assert outsider_session.get(f'/api/people/{worker["id"]}/one-on-ones').status_code == 404
+    assert worker_session.post(f'/api/one-on-ones/{note["id"]}/confirm').status_code == 200
+    assert worker_session.get(f'/api/people/{worker["id"]}/growth-actions').json()[0]['title'] == '独立负责下一阶段成像方案'
+    result = manager_session.post(f'/api/issues/{iid}/feedback', data={
+        'kind': '协助', 'content': '协调光学资源进行三批次验证', 'recipient_id': worker['id'],
+        'visibility': 'self_manager'}, files=[('files', ('plan.txt', b'private plan', 'text/plain'))])
+    assert result.status_code == 200, result.text
+    attachment = result.json()['attachments'][0]['url']
+    assert worker_session.get(attachment).status_code == 200
+    assert outsider_session.get(attachment).status_code == 404
+    assert worker_session.get('/api/notifications').json()
+    assert manager_session.post(f'/api/issues/{iid}/decisions', json={
+        'fact': '条纹反光', 'decision': '采用偏振加分区曝光', 'commitment': '完成三批次验证',
+        'owner_id': worker['id'], 'due_date': str(date.today()+timedelta(days=7))}).status_code == 200
+    assert worker_session.get(f'/api/issues/{iid}/decisions').json()[0]['fact'] == '条纹反光'
+    report = worker_session.get('/api/reports/weekly').json()
+    assert worker_session.put('/api/reports/weekly', json={'week_start': report['week_start'],
+         'content': report['content']+'\n本周结论', 'confirm': True}).status_code == 200
+    assert worker_session.get('/api/reports/weekly').json()['confirmed_at']
+    assert manager_session.get('/api/management/overview').status_code == 200

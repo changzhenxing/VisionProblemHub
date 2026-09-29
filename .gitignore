@@ -7,4 +7,6 @@ data/verify_data/
 data/uploads/*
 !data/uploads/.gitkeep
 data/backups/
+data/private_feedback/
+data/verify_management/
 frontend/node_modules/

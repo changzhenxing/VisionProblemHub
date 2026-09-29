@@ -11,7 +11,7 @@ from sqlalchemy import inspect, select, text
 from sqlalchemy.orm import Session
 
 from .db import Base, SessionLocal, engine
-from .models import LoginSession, Role, User
+from .models import LoginSession, Role, User, UserRole, Project, ProjectMember, Issue, IssueEvent, Team
 
 COOKIE_NAME = "vph_session"
 SESSION_HOURS = 12
@@ -21,13 +21,26 @@ PERMISSIONS = {
     "projects.write": "创建和修改项目及项目复盘",
     "issues.write": "创建和处理问题及问题复盘",
     "knowledge.write": "修订知识案例",
+    "feedback.write": "发表问题反馈",
+    "people.read": "查看人员工作与能力证据",
+    "people.manage": "管理沟通与成长记录",
+    "org.manage": "管理组织与项目成员",
+    "milestones.write": "管理里程碑",
+    "reports.write": "确认周报",
+    "audit.read": "查看审计记录",
 }
 SYSTEM_ROLES = (
     ("管理员", "管理用户、角色及全部业务数据", list(PERMISSIONS)),
-    ("项目负责人", "管理项目、问题和知识", ["projects.write", "issues.write", "knowledge.write"]),
-    ("团队成员", "记录和处理问题", ["issues.write"]),
+    ("部门负责人", "部门项目与人员管理", ["projects.write", "issues.write", "feedback.write", "people.read", "people.manage", "org.manage", "milestones.write", "reports.write"]),
+    ("团队主管", "团队项目与人员培养", ["projects.write", "issues.write", "feedback.write", "people.read", "people.manage", "milestones.write", "reports.write"]),
+    ("项目负责人", "管理项目、问题和知识", ["projects.write", "issues.write", "knowledge.write", "feedback.write", "people.read", "milestones.write", "reports.write"]),
+    ("技术负责人", "技术方案与问题决策", ["issues.write", "feedback.write", "knowledge.write", "people.read", "reports.write"]),
+    ("团队成员", "记录和处理问题", ["issues.write", "feedback.write", "reports.write"]),
+    ("专家", "跨项目技术支持", ["issues.write", "feedback.write", "knowledge.write", "people.read", "reports.write"]),
+    ("知识管理员", "审核和整理知识", ["knowledge.write", "people.read", "reports.write"]),
     ("只读成员", "查看项目、问题和知识", []),
 )
+SCOPES = {"self", "project", "team", "department", "all"}
 
 
 def ensure_auth_schema():
@@ -40,11 +53,17 @@ def ensure_auth_schema():
             conn.execute(text("ALTER TABLE users ADD COLUMN password_hash VARCHAR(256)"))
         if "active" not in columns:
             conn.execute(text("ALTER TABLE users ADD COLUMN active BOOLEAN NOT NULL DEFAULT 1"))
+        if "team_id" not in columns:
+            conn.execute(text("ALTER TABLE users ADD COLUMN team_id INTEGER REFERENCES teams(id)"))
     Base.metadata.create_all(bind=engine)
     with SessionLocal() as db:
         for name, description, permissions in SYSTEM_ROLES:
-            if not db.scalar(select(Role).where(Role.name == name)):
+            role = db.scalar(select(Role).where(Role.name == name))
+            if not role:
                 db.add(Role(name=name, description=description, permissions_json=json.dumps(permissions), is_system=True))
+            elif role.is_system:
+                role.description = description
+                role.permissions_json = json.dumps(permissions)
         db.flush()
         roles = {role.name: role for role in db.scalars(select(Role)).all()}
         users = db.scalars(select(User).where(User.role_id.is_(None)).order_by(User.id)).all()
@@ -53,6 +72,25 @@ def ensure_auth_schema():
             if name not in roles:
                 name = "项目负责人" if user.role == "团队负责人" else "团队成员"
             user.role_id = roles[name].id
+        db.flush()
+        for user in db.scalars(select(User).order_by(User.id)):
+            if not db.scalar(select(UserRole.id).where(UserRole.user_id == user.id).limit(1)):
+                db.add(UserRole(user_id=user.id, role_id=user.role_id,
+                                scope="all" if user.name == "管理员" else "self"))
+        memberships = set(db.execute(select(ProjectMember.project_id, ProjectMember.user_id)).all())
+        def add_member(project_id: int, user_id: int, member_role: str = "成员"):
+            if (project_id, user_id) not in memberships:
+                db.add(ProjectMember(project_id=project_id, user_id=user_id, member_role=member_role))
+                memberships.add((project_id, user_id))
+        for project in db.scalars(select(Project)):
+            add_member(project.id, project.manager_id, "负责人")
+        for issue in db.scalars(select(Issue)):
+            for user_id in {issue.owner_id, issue.created_by_id}:
+                add_member(issue.project_id, user_id)
+        for event in db.scalars(select(IssueEvent).where(IssueEvent.actor_id.is_not(None))):
+            issue = db.get(Issue, event.issue_id)
+            if issue:
+                add_member(issue.project_id, event.actor_id)
         db.commit()
 
 
@@ -82,20 +120,31 @@ def setup_required(db: Session) -> bool:
 
 
 def permissions_for(user: User) -> set[str]:
-    if not user.assigned_role:
-        return set()
-    try:
-        return set(json.loads(user.assigned_role.permissions_json)) & PERMISSIONS.keys()
-    except (ValueError, TypeError):
-        return set()
+    with SessionLocal() as db:
+        roles = db.scalars(select(Role).join(UserRole, UserRole.role_id == Role.id).where(UserRole.user_id == user.id)).all()
+        if not roles and user.assigned_role:
+            roles = [user.assigned_role]
+        result = set()
+        for role in roles:
+            try:
+                result.update(json.loads(role.permissions_json))
+            except (ValueError, TypeError):
+                pass
+        return result & PERMISSIONS.keys()
 
 
 def user_dict(user: User) -> dict:
+    with SessionLocal() as db:
+        assignments = db.execute(select(UserRole, Role).join(Role, UserRole.role_id == Role.id)
+                                 .where(UserRole.user_id == user.id).order_by(UserRole.id)).all()
     return {
         "id": user.id,
         "name": user.name,
         "role_id": user.role_id,
         "role": user.assigned_role.name if user.assigned_role else user.role,
+        "roles": [{"id": assignment.id, "role_id": role.id, "name": role.name,
+                   "scope": assignment.scope, "scope_id": assignment.scope_id} for assignment, role in assignments],
+        "team_id": user.team_id,
         "active": user.active,
         "has_password": bool(user.password_hash),
         "permissions": sorted(permissions_for(user)),
@@ -146,6 +195,12 @@ def required_permission(path: str, method: str) -> str | None:
         return "users.manage"
     if method in {"GET", "HEAD", "OPTIONS"}:
         return None
+    if path.startswith("/api/org/") or (path.startswith("/api/projects/") and "/members" in path):
+        return "org.manage"
+    if path.startswith("/api/milestones/") or (path.startswith("/api/projects/") and "/milestones" in path):
+        return "milestones.write"
+    if path.startswith("/api/issues/") and (path.endswith("/feedback") or path.endswith("/decisions")):
+        return "feedback.write"
     if path.startswith("/api/projects"):
         return "projects.write"
     if path.startswith("/api/issues"):
