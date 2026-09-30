@@ -6,10 +6,11 @@ import EventTimeline from './components/EventTimeline.vue'
 import IssueCommunication from './components/IssueCommunication.vue'
 import ProjectCollaboration from './components/ProjectCollaboration.vue'
 import PeopleManagement from './components/PeopleManagement.vue'
+import AgentWorkspace from './components/AgentWorkspace.vue'
 
 const baseNav = [
   ['workbench', '我的工作台'], ['projects', '项目'], ['issues', '问题'],
-  ['stats', '统计趋势'], ['retro', '项目复盘'], ['knowledge', '知识库'], ['people', '人员与沟通'],
+  ['stats', '统计趋势'], ['retro', '项目复盘'], ['knowledge', '知识库'], ['agent', '智能 Agent'], ['people', '人员与沟通'],
 ]
 const issueRetroFields = [
   ['phenomenon', '问题现象'], ['impact', '问题影响'], ['process_summary', '处理过程'],
@@ -374,6 +375,11 @@ async function saveKnowledge() { await act(async () => {
 function barMax(items) { return Math.max(1, ...items.map((item) => item.count)) }
 function date(value) { return value ? String(value).slice(0, 10) : '' }
 function downloadAgentExport() { window.open('/api/knowledge/export/agent', '_blank', 'noopener') }
+function openAgentSource(source) {
+  if (source.type === 'issue') openIssue(source.id)
+  if (source.type === 'project') openProject(source.id)
+  if (source.type === 'knowledge') openKnowledge(source.id)
+}
 </script>
 
 <template>
@@ -436,6 +442,8 @@ function downloadAgentExport() { window.open('/api/knowledge/export/agent', '_bl
     </template>
 
     <template v-else-if="page === 'people'"><PeopleManagement :api="api" :current-user="currentUser" :permissions="currentUser?.permissions || []" @open-issue="openIssue" /></template>
+
+    <template v-else-if="page === 'agent'"><AgentWorkspace :api="api" :permissions="currentUser?.permissions || []" @open-source="openAgentSource" /></template>
 
     <template v-else-if="page === 'admin'">
       <div class="page-head"><div><h1>用户与角色</h1><p>停用用户会保留项目、问题和操作历史；内置角色不可修改。</p></div></div>

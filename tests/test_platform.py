@@ -259,3 +259,95 @@ def test_management_feedback_people_and_scope():
          'content': report['content']+'\n本周结论', 'confirm': True}).status_code == 200
     assert worker_session.get('/api/reports/weekly').json()['confirmed_at']
     assert manager_session.get('/api/management/overview').status_code == 200
+
+
+def test_agent_model_tools_scope_and_confirmed_write(monkeypatch):
+    import json
+    from app import agent
+    from app.db import SessionLocal
+    from app.models import AgentModel
+
+    issue = client.get('/api/issues').json()[0]
+    iid = issue['id']
+    config = {'name': '验证模型', 'base_url': 'https://model.example/v1',
+              'model_name': 'test-tool-model', 'api_key': 'test-only-secret', 'is_active': True}
+    assert client.post('/api/agent/models', json=config).status_code == 200
+    listing = client.get('/api/agent/models').json()
+    assert listing[0]['has_api_key'] and 'api_key' not in listing[0]
+    with SessionLocal() as db:
+        stored = db.get(AgentModel, listing[0]['id'])
+        assert 'test-only-secret' not in stored.api_key_encrypted
+    assert client.get('/api/agent/status').json()['configured']
+
+    def scripted(*replies):
+        responses = iter(replies)
+        monkeypatch.setattr(agent, '_chat_completion', lambda *args, **kwargs: next(responses))
+
+    search_call = {'id': 'call_search', 'type': 'function', 'function': {
+        'name': 'search_issues', 'arguments': json.dumps({'query': issue['description'][:8]}, ensure_ascii=False)}}
+    scripted({'content': None, 'tool_calls': [search_call]}, {'content': '已找到相关问题。'})
+    answer = client.post('/api/agent/chat', json={'message': '查找反光问题'}).json()
+    assert any(source['id'] == iid for source in answer['message']['sources'])
+    conversation_id = answer['conversation_id']
+    assert client.get(f'/api/agent/conversations/{conversation_id}').json()['messages'][-1]['trace'][0]['tool'] == 'search_issues'
+
+    viewer_role = next(role for role in client.get('/api/admin/roles').json() if role['name'] == '只读成员')
+    assert client.post('/api/users', json={'name': 'Agent无权用户', 'role_id': viewer_role['id'],
+                                            'password': 'ViewerPassword123!'}).status_code == 200
+    viewer = TestClient(app)
+    assert viewer.post('/api/auth/login', json={'name': 'Agent无权用户', 'password': 'ViewerPassword123!'}).status_code == 200
+    assert viewer.get('/api/agent/models').status_code == 403
+    assert viewer.get(f'/api/agent/conversations/{conversation_id}').status_code == 404
+    scripted({'content': None, 'tool_calls': [search_call]}, {'content': '没有可见记录。'})
+    restricted = viewer.post('/api/agent/chat', json={'message': '查找反光问题'}).json()
+    assert restricted['message']['sources'] == []
+
+    before = len(client.get(f'/api/issues/{iid}').json()['events'])
+    draft_call = {'id': 'call_draft', 'type': 'function', 'function': {
+        'name': 'draft_issue_event', 'arguments': json.dumps({'issue_id': iid, 'event_type': '进展反馈',
+                                                              'content': 'Agent起草待确认的验证进展'}, ensure_ascii=False)}}
+    scripted({'content': None, 'tool_calls': [draft_call]}, {'content': '已起草，等待确认。'})
+    drafted = client.post('/api/agent/chat', json={'message': '起草一条问题进展'}).json()
+    action = drafted['message']['actions'][0]
+    assert action['status'] == 'pending'
+    assert len(client.get(f'/api/issues/{iid}').json()['events']) == before
+    assert viewer.post(f'/api/agent/actions/{action["id"]}/apply').status_code == 404
+    assert client.post(f'/api/agent/actions/{action["id"]}/apply').status_code == 200
+    assert len(client.get(f'/api/issues/{iid}').json()['events']) == before + 1
+    assert client.post(f'/api/agent/actions/{action["id"]}/apply').status_code == 409
+
+
+def test_agent_provider_request_and_url_validation(monkeypatch):
+    import json
+    from app import agent
+    from app.db import SessionLocal
+    from app.models import AgentModel
+
+    assert client.post('/api/agent/models', json={
+        'name': '不安全地址', 'base_url': 'http://remote.example/v1', 'model_name': 'x'}).status_code == 400
+    observed = {}
+
+    class Response:
+        def __enter__(self): return self
+        def __exit__(self, *args): pass
+        def read(self, limit):
+            return b'{"choices":[{"message":{"role":"assistant","content":"ok"}}]}'
+
+    class Opener:
+        def open(self, request, timeout):
+            observed['url'] = request.full_url
+            observed['body'] = json.loads(request.data)
+            observed['auth'] = request.get_header('Authorization')
+            observed['timeout'] = timeout
+            return Response()
+
+    monkeypatch.setattr(agent.urllib.request, 'build_opener', lambda handler: Opener())
+    with SessionLocal() as db:
+        model = db.get(AgentModel, client.get('/api/agent/models').json()[0]['id'])
+        result = agent._chat_completion(model, [{'role': 'user', 'content': 'ping'}], agent.TOOLS[:1])
+    assert result['content'] == 'ok'
+    assert observed['url'] == 'https://model.example/v1/chat/completions'
+    assert observed['body']['tools'][0]['function']['name'] == 'get_my_workbench'
+    assert observed['body']['messages'][0]['content'] == 'ping'
+    assert observed['auth'] == 'Bearer test-only-secret'
+    assert observed['timeout'] == 35

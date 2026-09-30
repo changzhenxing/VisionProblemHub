@@ -28,6 +28,7 @@ PERMISSIONS = {
     "milestones.write": "管理里程碑",
     "reports.write": "确认周报",
     "audit.read": "查看审计记录",
+    "models.manage": "管理 Agent 模型配置",
 }
 SYSTEM_ROLES = (
     ("管理员", "管理用户、角色及全部业务数据", list(PERMISSIONS)),
@@ -189,6 +190,8 @@ def authenticated_user(request: Request, db: Session) -> User:
 
 
 def required_permission(path: str, method: str) -> str | None:
+    if path.startswith("/api/agent/models"):
+        return "models.manage"
     if path.startswith("/api/admin/roles") or path == "/api/admin/permissions":
         return "roles.manage"
     if path.startswith("/api/admin/users") or (path == "/api/users" and method != "GET"):

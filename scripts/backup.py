@@ -14,6 +14,9 @@ with tar: src.backup(tar)
 src.close(); tar.close(); print(dst)
 files = [path for name in ("uploads", "private_feedback")
          for path in (DATA_DIR / name).rglob("*") if path.is_file()]
+agent_key = DATA_DIR / "agent-credentials.key"
+if agent_key.is_file():
+    files.append(agent_key)
 if files:
     archive = dst.with_suffix(".attachments.zip")
     with ZipFile(archive, "w", ZIP_DEFLATED) as bundle:

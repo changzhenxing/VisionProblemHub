@@ -19,6 +19,7 @@ from .auth import (COOKIE_NAME, SESSION_HOURS, PERMISSIONS, ensure_auth_schema, 
 from .access import can_project, can_issue, can_person, require_project, require_issue, grants
 from .management import router as management_router, audit
 from .people import router as people_router
+from .agent import router as agent_router
 from .schemas import *
 from .services import (
     is_delayed, delay_days, project_health, add_event, save_attachment,
@@ -34,6 +35,7 @@ app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 app.mount("/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads")
 app.include_router(management_router)
 app.include_router(people_router)
+app.include_router(agent_router)
 
 @app.middleware("http")
 async def authentication(request: Request, call_next):
