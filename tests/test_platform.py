@@ -327,21 +327,20 @@ def test_agent_provider_request_and_url_validation(monkeypatch):
         'name': '不安全地址', 'base_url': 'http://remote.example/v1', 'model_name': 'x'}).status_code == 400
     observed = {}
 
-    class Response:
-        def __enter__(self): return self
-        def __exit__(self, *args): pass
-        def read(self, limit):
-            return b'{"choices":[{"message":{"role":"assistant","content":"ok"}}]}'
+    real_client = agent.httpx.Client
 
-    class Opener:
-        def open(self, request, timeout):
-            observed['url'] = request.full_url
-            observed['body'] = json.loads(request.data)
-            observed['auth'] = request.get_header('Authorization')
-            observed['timeout'] = timeout
-            return Response()
+    def model_response(request):
+        observed['url'] = str(request.url)
+        observed['body'] = json.loads(request.content)
+        observed['auth'] = request.headers.get('Authorization')
+        return agent.httpx.Response(200, json={'choices': [{'message': {'role': 'assistant', 'content': 'ok'}}]})
 
-    monkeypatch.setattr(agent.urllib.request, 'build_opener', lambda handler: Opener())
+    def mock_client(**kwargs):
+        observed['timeout'] = kwargs['timeout']
+        observed['follow_redirects'] = kwargs['follow_redirects']
+        return real_client(transport=agent.httpx.MockTransport(model_response), **kwargs)
+
+    monkeypatch.setattr(agent.httpx, 'Client', mock_client)
     with SessionLocal() as db:
         model = db.get(AgentModel, client.get('/api/agent/models').json()[0]['id'])
         result = agent._chat_completion(model, [{'role': 'user', 'content': 'ping'}], agent.TOOLS[:1])
@@ -351,6 +350,7 @@ def test_agent_provider_request_and_url_validation(monkeypatch):
     assert observed['body']['messages'][0]['content'] == 'ping'
     assert observed['auth'] == 'Bearer test-only-secret'
     assert observed['timeout'] == 35
+    assert observed['follow_redirects'] is False
 
 
 def test_agent_conversational_operations_reuse_business_permissions(monkeypatch):

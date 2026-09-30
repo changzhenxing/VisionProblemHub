@@ -7,8 +7,6 @@ import re
 import asyncio
 import secrets
 import uuid
-import urllib.error
-import urllib.request
 from datetime import datetime, timedelta
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -105,11 +103,6 @@ def _key(model: AgentModel) -> str:
         raise HTTPException(503, "模型密钥无法解密，请管理员重新保存 API Key") from exc
 
 
-class _NoRedirect(urllib.request.HTTPRedirectHandler):
-    def redirect_request(self, request, fp, code, msg, headers, newurl):
-        return None
-
-
 def _chat_completion(model: AgentModel, messages: list[dict], tools: list[dict] | None = None) -> dict:
     body = {"model": model.model_name, "messages": messages, "stream": False}
     if tools:
@@ -119,12 +112,17 @@ def _chat_completion(model: AgentModel, messages: list[dict], tools: list[dict] 
     key = _key(model)
     if key:
         headers["Authorization"] = f"Bearer {key}"
-    request = urllib.request.Request(
-        f"{model.base_url}/chat/completions", data=json.dumps(body, ensure_ascii=False).encode(),
-        headers=headers, method="POST")
     try:
-        with urllib.request.build_opener(_NoRedirect()).open(request, timeout=35) as response:
-            raw = response.read(256_001)
+        with httpx.Client(timeout=35, follow_redirects=False) as client:
+            with client.stream("POST", f"{model.base_url}/chat/completions", json=body, headers=headers) as response:
+                response.raise_for_status()
+                chunks, size = [], 0
+                for chunk in response.iter_bytes():
+                    size += len(chunk)
+                    if size > 256_000:
+                        raise HTTPException(502, "模型响应过大")
+                    chunks.append(chunk)
+                raw = b"".join(chunks)
         if len(raw) > 256_000:
             raise HTTPException(502, "模型响应过大")
         payload = json.loads(raw)
@@ -132,9 +130,9 @@ def _chat_completion(model: AgentModel, messages: list[dict], tools: list[dict] 
         if not isinstance(message, dict):
             raise ValueError("message")
         return message
-    except urllib.error.HTTPError as exc:
-        raise HTTPException(502, f"模型接口返回 HTTP {exc.code}，请检查地址、模型名和密钥") from exc
-    except (urllib.error.URLError, TimeoutError) as exc:
+    except httpx.HTTPStatusError as exc:
+        raise HTTPException(502, f"模型接口返回 HTTP {exc.response.status_code}，请检查地址、模型名和密钥") from exc
+    except httpx.RequestError as exc:
         raise HTTPException(502, "无法连接模型接口，请检查地址与网络") from exc
     except (ValueError, KeyError, IndexError, TypeError) as exc:
         raise HTTPException(502, "模型接口返回了不兼容的响应") from exc
