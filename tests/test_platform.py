@@ -351,3 +351,185 @@ def test_agent_provider_request_and_url_validation(monkeypatch):
     assert observed['body']['messages'][0]['content'] == 'ping'
     assert observed['auth'] == 'Bearer test-only-secret'
     assert observed['timeout'] == 35
+
+
+def test_agent_conversational_operations_reuse_business_permissions(monkeypatch):
+    import json
+    from app import agent
+
+    def propose(operation, arguments, session=client):
+        replies = iter([
+            {'content': None, 'tool_calls': [{'id': 'call_operation', 'type': 'function',
+             'function': {'name': 'prepare_operation', 'arguments': json.dumps(
+                 {'operation': operation, 'arguments': arguments}, ensure_ascii=False)}}]},
+            {'content': '操作草案已准备，请确认。'},
+        ])
+        monkeypatch.setattr(agent, '_chat_completion', lambda *args, **kwargs: next(replies))
+        response = session.post('/api/agent/chat', json={'message': f'请{operation}'})
+        assert response.status_code == 200, response.text
+        return response.json()
+
+    iid = client.get('/api/issues').json()[0]['id']
+    before = len(client.get(f'/api/issues/{iid}').json()['events'])
+    draft = propose('add_issue_event', {'issue_id': iid, 'event_type': '进展反馈', 'content': '对话执行验证'})
+    command = draft['message']['actions'][0]
+    assert command['kind'] == 'command' and command['status'] == 'pending'
+    assert len(client.get(f'/api/issues/{iid}').json()['events']) == before
+    invalid = propose('update_issue', {'issue_id': iid, 'status': '已关闭', 'password': 'injected'})
+    assert invalid['message']['actions'] == []
+    assert invalid['message']['trace'][0]['status'] == 'invalid'
+
+    viewer = TestClient(app)
+    assert viewer.post('/api/auth/login', json={'name': 'Agent无权用户', 'password': 'ViewerPassword123!'}).status_code == 200
+    assert viewer.post(f'/api/agent/commands/{command["id"]}/apply').status_code == 404
+    denied = propose('add_issue_event', {'issue_id': iid, 'event_type': '进展反馈', 'content': '越权'}, viewer)
+    assert denied['message']['actions'] == []
+    confirm = client.post('/api/agent/chat', json={'conversation_id': draft['conversation_id'],
+                         'message': f'确认 {command["id"]}'})
+    assert confirm.status_code == 200, confirm.text
+    assert len(client.get(f'/api/issues/{iid}').json()['events']) == before + 1
+    assert client.post(f'/api/agent/commands/{command["id"]}/apply').status_code == 409
+
+    project = client.get('/api/projects').json()[0]
+    change = propose('update_project', {'project_id': project['id'], 'description': 'Agent 对话更新的项目说明'})
+    command_id = change['message']['actions'][0]['id']
+    assert client.get(f'/api/projects/{project["id"]}').json()['description'] != 'Agent 对话更新的项目说明'
+    assert client.post(f'/api/agent/commands/{command_id}/apply').status_code == 200
+    assert client.get(f'/api/projects/{project["id"]}').json()['description'] == 'Agent 对话更新的项目说明'
+
+    no_write = propose('create_department', {'name': '待取消的部门'})
+    cancelled = no_write['message']['actions'][0]['id']
+    assert client.post(f'/api/agent/commands/{cancelled}/cancel').status_code == 200
+    assert client.post(f'/api/agent/commands/{cancelled}/apply').status_code == 409
+    assert all(row['name'] != '待取消的部门' for row in client.get('/api/org/departments').json())
+
+
+def test_agent_platform_read_is_allowlisted_and_scoped():
+    from app import agent
+    from app.db import SessionLocal
+    from app.models import User
+    from sqlalchemy import select
+
+    assert agent._read_path('/api/issues')
+    assert agent._read_path('/api/issues/12/feedback')
+    assert agent._read_path('/api/agent/models')
+    assert not agent._read_path('/api/auth/me')
+    assert not agent._read_path('/api/issues/../admin/users')
+    assert not agent._read_path('/api/feedback-files/1')
+    with SessionLocal() as db:
+        user = db.scalar(select(User).where(User.name == '管理员'))
+        sources, drafts, commands = {}, [], []
+        cookie = client.cookies.get('vph_session')
+        result = agent._run_tool('read_platform', {'path': '/api/projects'}, db, user,
+                                 {'projects.write'}, sources, drafts, commands, cookie)
+        assert result['data']
+
+
+def test_agent_staged_file_and_one_time_user_password(monkeypatch):
+    import json
+    from app import agent
+
+    def draft(operation, arguments):
+        replies = iter([{'content': None, 'tool_calls': [{'id': 'one', 'type': 'function',
+            'function': {'name': 'prepare_operation', 'arguments': json.dumps({
+                'operation': operation, 'arguments': arguments}, ensure_ascii=False)}}]},
+            {'content': '请确认。'}])
+        monkeypatch.setattr(agent, '_chat_completion', lambda *args, **kwargs: next(replies))
+        response = client.post('/api/agent/chat', json={'message': '准备操作'})
+        assert response.status_code == 200, response.text
+        return response.json()['message']['actions'][0]
+
+    staged = client.post('/api/agent/uploads', files=[('files', ('check.txt', b'evidence', 'text/plain'))])
+    assert staged.status_code == 200
+    upload_id = staged.json()[0]['id']
+    iid = client.get('/api/issues').json()[0]['id']
+    command = draft('add_issue_event', {'issue_id': iid, 'event_type': '验证结果',
+                    'content': '附件验证结果', 'upload_ids': [upload_id]})
+    assert client.post(f'/api/agent/commands/{command["id"]}/apply').status_code == 200
+    events = client.get(f'/api/issues/{iid}').json()['events']
+    assert any(any(file['name'] == 'check.txt' for file in event['attachments']) for event in events)
+    assert client.post(f'/api/agent/commands/{command["id"]}/apply').status_code == 409
+
+    role = next(item for item in client.get('/api/admin/roles').json() if item['name'] == '团队成员')
+    created = draft('create_user', {'name': '对话创建的用户', 'role_id': role['id']})
+    assert all(item['name'] != '对话创建的用户' for item in client.get('/api/admin/users').json())
+    applied = client.post(f'/api/agent/commands/{created["id"]}/apply')
+    assert applied.status_code == 200, applied.text
+    password = applied.json()['initial_password']
+    assert len(password) >= 20
+    assert password not in client.get(f'/api/agent/conversations').text
+    session = TestClient(app)
+    assert session.post('/api/auth/login', json={'name': '对话创建的用户', 'password': password}).status_code == 200
+
+
+def test_agent_secure_inputs_are_not_sent_to_model_or_saved_in_history(monkeypatch):
+    import json
+    from app import agent
+
+    def prepare(session, operation, arguments):
+        replies = iter([{'content': None, 'tool_calls': [{'id': 'secure', 'type': 'function',
+            'function': {'name': 'prepare_operation', 'arguments': json.dumps({
+                'operation': operation, 'arguments': arguments}, ensure_ascii=False)}}]},
+            {'content': '请在安全输入框填写凭据并确认。'}])
+        monkeypatch.setattr(agent, '_chat_completion', lambda *args, **kwargs: next(replies))
+        result = session.post('/api/agent/chat', json={'message': f'准备{operation}'})
+        assert result.status_code == 200, result.text
+        return result.json()
+
+    model = prepare(client, 'create_model', {'name': '对话配置模型', 'base_url': 'https://example.org/v1',
+                    'model_name': 'demo-model', 'is_active': False})
+    command = model['message']['actions'][0]
+    assert 'private-api-key' not in json.dumps(command)
+    result = client.post(f'/api/agent/commands/{command["id"]}/apply',
+                         json={'secure': {'api_key': 'private-api-key'}})
+    assert result.status_code == 200, result.text
+    detail = client.get(f'/api/agent/conversations/{model["conversation_id"]}').text
+    assert 'private-api-key' not in detail
+    listing = client.get('/api/agent/models').json()
+    assert next(item for item in listing if item['name'] == '对话配置模型')['has_api_key']
+
+    user = TestClient(app)
+    # A separate account with a known password tests cookie replacement after a secure password change.
+    role = next(item for item in client.get('/api/admin/roles').json() if item['name'] == '团队成员')
+    assert client.post('/api/users', json={'name': '密码对话测试', 'role_id': role['id'],
+                       'password': 'OldPassword123!'}).status_code == 200
+    assert user.post('/api/auth/login', json={'name': '密码对话测试',
+                     'password': 'OldPassword123!'}).status_code == 200
+    changed = prepare(user, 'change_my_password', {})
+    change_id = changed['message']['actions'][0]['id']
+    assert user.post(f'/api/agent/commands/{change_id}/apply').status_code == 400
+    applied = user.post(f'/api/agent/commands/{change_id}/apply', json={'secure': {
+        'current_password': 'OldPassword123!', 'new_password': 'NewPassword123!'}})
+    assert applied.status_code == 200, applied.text
+    assert user.get('/api/projects').status_code == 200
+    assert user.post('/api/auth/login', json={'name': '密码对话测试',
+                     'password': 'OldPassword123!'}).status_code == 401
+    assert 'NewPassword123!' not in user.get(f'/api/agent/conversations/{changed["conversation_id"]}').text
+
+
+def test_agent_rechecks_permissions_when_confirming(monkeypatch):
+    import json
+    from app import agent
+
+    role = client.post('/api/admin/roles', json={'name': '待收回的 Agent 权限',
+                       'permissions': ['issues.write']}).json()
+    created = client.post('/api/users', json={'name': '权限变更用户', 'role_id': role['id'],
+                          'scope': 'all', 'password': 'RolePassword123!'})
+    assert created.status_code == 200
+    session = TestClient(app)
+    assert session.post('/api/auth/login', json={'name': '权限变更用户',
+                        'password': 'RolePassword123!'}).status_code == 200
+    iid = client.get('/api/issues').json()[0]['id']
+    replies = iter([{'content': None, 'tool_calls': [{'id': 'permission', 'type': 'function',
+        'function': {'name': 'prepare_operation', 'arguments': json.dumps({
+            'operation': 'add_issue_event', 'arguments': {'issue_id': iid,
+            'event_type': '进展反馈', 'content': '权限收回后不可写'}}, ensure_ascii=False)}}]},
+        {'content': '请确认。'}])
+    monkeypatch.setattr(agent, '_chat_completion', lambda *args, **kwargs: next(replies))
+    drafted = session.post('/api/agent/chat', json={'message': '准备进展'})
+    assert drafted.status_code == 200
+    command_id = drafted.json()['message']['actions'][0]['id']
+    assert client.patch(f'/api/admin/roles/{role["id"]}', json={'name': role['name'],
+                        'permissions': []}).status_code == 200
+    assert session.post(f'/api/agent/commands/{command_id}/apply').status_code == 403
+    assert session.get(f'/api/agent/conversations/{drafted.json()["conversation_id"]}').json()['messages'][-1]['actions'][0]['status'] == 'pending'

@@ -8,6 +8,8 @@ data/uploads/*
 !data/uploads/.gitkeep
 data/backups/
 data/server-*.log
+data/agent-credentials.key
+data/agent_staging/
 data/private_feedback/
 data/verify_management/
 frontend/node_modules/

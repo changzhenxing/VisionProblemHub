@@ -4,3 +4,4 @@ sqlalchemy==2.0.50
 pydantic==2.13.4
 python-multipart>=0.0.9
 cryptography>=46,<48
+httpx>=0.28,<1
