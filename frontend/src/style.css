@@ -20,7 +20,7 @@ header nav{order:3;flex:1 0 100%;justify-content:center}
 body{background:linear-gradient(180deg,#edf2ff 0,#f7f9ff 320px,var(--bg) 100%)}
 header{background:linear-gradient(180deg,#fbfcff,#edf2ff);border-bottom-color:#d8e2ff;box-shadow:0 3px 18px rgba(49,94,251,.07)}
 .brand b,.page-head h1,.panel h2,.panel h3,.auth-card h1,.modal-card h2{color:#253a78}
-.brand .logo{background:linear-gradient(145deg,#b8caff,#e7ecff);color:#2448d8;border:1px solid #9db4ff;box-shadow:0 4px 12px rgba(49,94,251,.16)}
+.brand .logo{display:block;flex:none;width:40px;height:40px;border:0;border-radius:12px;background:none;box-shadow:0 4px 12px rgba(49,94,251,.16)}
 header nav button{color:#485e9f}
 header nav button.active,header nav button:hover{background:#dfe7ff;color:#2448d8}
 .primary{background:var(--blue)!important;color:#fff!important;border:1px solid var(--blue);box-shadow:0 3px 10px rgba(49,94,251,.20)}

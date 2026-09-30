@@ -378,7 +378,7 @@ function downloadAgentExport() { window.open('/api/knowledge/export/agent', '_bl
 
 <template>
   <header>
-    <div class="brand"><div class="logo">V</div><div><b>工业视觉项目与知识平台</b><small>问题驱动 · 过程留痕 · 自动复盘 · 经验沉淀</small></div></div>
+    <div class="brand"><img class="logo" src="/brand-mark.svg" alt="" width="40" height="40" /><div><b>工业视觉项目与知识平台</b><small>问题驱动 · 过程留痕 · 自动复盘 · 经验沉淀</small></div></div>
     <nav v-if="authUser"><button v-for="[key, label] in nav" :key="key" :class="{ active: page === key }" @click="navigate(key)">{{ label }}</button></nav>
     <div class="userbox" v-if="currentUser"><span>{{ currentUser.name }} · {{ currentUser.role }}</span><button v-if="can('issues.write')" class="primary" @click="openIssueCreate">＋ 新增问题</button><button class="secondary" @click="modal = 'passwordChange'">修改密码</button><button class="secondary" @click="signOut">退出</button></div>
   </header>
